@@ -412,7 +412,7 @@ namespace Godot.SourceGenerators
                             if (invSym.Name is "Defer" or "Record")
                                 return null;
 
-                            if (invSym.Name is "Try" or "Simulate")
+                            if (invSym.Name is "Try" or "Simulate" or "FirstOf" or "WhereCan")
                                 return anonFunc;
                         }
                     }
@@ -457,7 +457,7 @@ namespace Godot.SourceGenerators
             if (type == null)
                 return false;
             string ns = type.ContainingNamespace?.ToDisplayString() ?? string.Empty;
-            return ns == "VTX" && type.Name is "Tx" or "TxArray" or "TxList" or "TxDict" or "TxGodot";
+            return ns == "VTX" && type.Name is "Tx" or "TxArray" or "TxList" or "TxDict" or "TxGodot" or "TxTask" or "TxScope";
         }
 
         private static bool IsInsideSuspendsMethod(SemanticModel model, SyntaxNode node)
@@ -489,7 +489,8 @@ namespace Godot.SourceGenerators
         private static bool HasTxEffect(IMethodSymbol symbol)
         {
             return HasAttribute(symbol, "TransactsAttribute", "Transacts") ||
-                   HasAttribute(symbol, "DecidesAttribute", "Decides");
+                   HasAttribute(symbol, "DecidesAttribute", "Decides") ||
+                   HasAttribute(symbol, "TxInvariantAttribute", "TxInvariant");
         }
 
         private static bool HasAttribute(ISymbol symbol, string attrNameFull, string attrNameShort)

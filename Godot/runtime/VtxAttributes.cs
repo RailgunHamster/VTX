@@ -4,8 +4,21 @@ using System;
 namespace VTX;
 
 /// <summary>
+/// 由 [TxField] 源码生成器自动实现的接口，用于支持提交前类不变量（[TxInvariant]）自动校验。
+/// </summary>
+public interface ITxObject
+{
+    /// <summary>校验当前对象的所有 [TxInvariant] 契约，不满足时调用 Tx.Check / Tx.Fail 触发回滚。</summary>
+    [Decides]
+    void ValidateTxInvariants();
+}
+
+/// <summary>
 /// 标记在 partial class 的私有字段上（如 [TxField] private int _gold;），
-/// 编译器 Source Generator 会自动生成带 Undo Log 记录的同名公开属性（如 public int Gold）。
+/// 编译器 Source Generator 会自动生成：
+/// 1. 带 Undo Log 记录的同名公开属性（如 public int Gold）；
+/// 2. 强类型快照结构体 TxSnapshot 及 CaptureTxSnapshot() / RestoreTxSnapshot() / DiffTxState() 方法；
+/// 3. ITxObject 接口实现（联动 [TxInvariant] 在事务提交前自动校验）。
 /// </summary>
 [AttributeUsage(AttributeTargets.Field, Inherited = false, AllowMultiple = false)]
 public sealed class TxFieldAttribute : Attribute
@@ -13,6 +26,14 @@ public sealed class TxFieldAttribute : Attribute
     public string? PropertyName { get; }
     public TxFieldAttribute(string? propertyName = null) => PropertyName = propertyName;
 }
+
+/// <summary>
+/// 标记在 partial class 的无参校验方法上（如 [TxInvariant] private void CheckValid() => Tx.Check(Gold >= 0);）。
+/// 当事务修改了该对象的任何 [TxField] 属性并准备 Commit 时，运行时会自动调用此方法；
+/// 若校验失败，整个事务将自动回滚，防止非法脏状态提交。
+/// </summary>
+[AttributeUsage(AttributeTargets.Method, Inherited = true, AllowMultiple = false)]
+public sealed class TxInvariantAttribute : Attribute { }
 
 /// <summary>
 /// 标记方法或属性访问器在事务中可安全回滚。

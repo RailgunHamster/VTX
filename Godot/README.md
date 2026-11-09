@@ -10,7 +10,8 @@
 Godot/
 ├── README.md                   # Godot 模块接入与构建说明
 ├── docs/
-│   └── AI_GUIDE.md             # 人类与 AI Agent 编写规范与排错手册（可直接被项目 AGENTS.md 引用）
+│   ├── AI_GUIDE.md             # 人类与 AI Agent 编写规范与排错手册（可直接被项目 AGENTS.md 引用）
+│   └── Examples.cs             # 涵盖全部 VTX 特性的完整可编译代码示例
 ├── runtime/                    # 链接编译进 GodotSharp.dll (namespace VTX)
 │   ├── VtxAttributes.cs        # [TxField], [Transacts], [Decides], [Suspends], [Pure], [NoRollback]
 │   ├── Tx.cs                   # 事务运行时：Tx.Try, Tx.Simulate, Tx.Check, Tx.Fail, Tx.Record, Tx.Defer
