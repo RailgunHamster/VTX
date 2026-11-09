@@ -1,0 +1,12 @@
+# Godot
+.godot/
+# .NET
+bin/
+obj/
+.vs/
+*.user
+# Python
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.venv/
