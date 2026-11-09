@@ -248,6 +248,55 @@ public static class Tx
     }
 
     /// <summary>
+    /// 带返回值的可回滚事务块：若成功通过所有校验并提交，将返回值赋给 result 并返回 true；
+    /// 若中途失败回滚，result 置为 default 并返回 false（避免在事务内直接修改外部局部变量触发 VTX001）。
+    /// </summary>
+    [Transacts]
+    public static bool Try<TResult>(Func<TResult> body, [MaybeNullWhen(false)] out TResult result)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+
+        var undoLog = _undoLog ??= new List<IUndoStep>(64);
+        var deferred = _deferredCommits ??= new List<Action>(16);
+        var touched = _touchedObjects ??= new List<ITxObject>(16);
+
+        int undoSavepoint = undoLog.Count;
+        int deferSavepoint = deferred.Count;
+        int touchedSavepoint = touched.Count;
+        if (_depth == 0)
+        {
+            _lastFailReason = null;
+        }
+        _depth++;
+
+        try
+        {
+            TResult temp = body();
+            ValidateTouchedInvariants(touched, touchedSavepoint);
+            _depth--;
+            if (_depth == 0)
+            {
+                CommitTopLevel(undoLog, deferred, touched);
+            }
+            result = temp;
+            return true;
+        }
+        catch (TxFailSignal)
+        {
+            _depth--;
+            RollbackToSavepoint(undoLog, deferred, touched, undoSavepoint, deferSavepoint, touchedSavepoint);
+            result = default;
+            return false;
+        }
+        catch
+        {
+            _depth--;
+            RollbackToSavepoint(undoLog, deferred, touched, undoSavepoint, deferSavepoint, touchedSavepoint);
+            throw;
+        }
+    }
+
+    /// <summary>
     /// Dry-Run 沙盒推演：在真实状态上试跑 body（含 [TxInvariant] 校验），随后强制 100% 回滚所有状态与延迟副作用。
     /// 适用于 UI CanExecute 判定、AI 出牌/走位前向推演、以及 aidbg 在线无损探测。
     /// </summary>
@@ -410,6 +459,44 @@ public static class Tx
     {
         _lastFailReason = reason ?? "Tx.Fail()";
         throw TxFailSignal.Instance;
+    }
+
+    /// <summary>
+    /// 可空引用解包断言（对应 Verse 的 ?Option 解包）：
+    /// 若 value 为 null 则记录失败表达式并立即中断回滚当前事务；否则返回非空值。
+    /// </summary>
+    [Decides]
+    [return: NotNull]
+    public static T NotNull<T>(
+        [NotNull] T? value,
+        string? reason = null,
+        [CallerArgumentExpression(nameof(value))] string? expr = null)
+        where T : class
+    {
+        if (value is null)
+        {
+            _lastFailReason = string.IsNullOrEmpty(reason) ? $"{expr} is not null" : $"{reason} ({expr} is not null)";
+            throw TxFailSignal.Instance;
+        }
+        return value;
+    }
+
+    /// <summary>
+    /// 可空值类型解包断言：若 value.HasValue 为 false 则立即中断回滚当前事务；否则返回其 Value。
+    /// </summary>
+    [Decides]
+    public static T NotNull<T>(
+        [NotNull] T? value,
+        string? reason = null,
+        [CallerArgumentExpression(nameof(value))] string? expr = null)
+        where T : struct
+    {
+        if (!value.HasValue)
+        {
+            _lastFailReason = string.IsNullOrEmpty(reason) ? $"{expr}.HasValue" : $"{reason} ({expr}.HasValue)";
+            throw TxFailSignal.Instance;
+        }
+        return value.Value;
     }
 
     /// <summary>

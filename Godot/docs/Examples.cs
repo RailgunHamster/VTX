@@ -8,19 +8,26 @@ using VTX;
 namespace GodotTest.Examples;
 
 /// <summary>
-/// VTX 全特性完整示例（包含基础事务、5 项进阶 Verse 特性与自定义复杂数据结构接入）。
-/// 本文件同时保存在：
-/// 1. engine/modules/vtx/Godot/docs/Examples.cs（文档参考示例）
-/// 2. godot-test/demo/VtxExamples.cs（在 godot-test 中直接编译并由 DemoPlayer 运行自检）
+/// VTX 全特性完整示例：
+/// 涵盖基础事务、回溯搜索、结构化并发、自动快照/Diff、类不变量、失败原因追踪、
+/// 以及新增的：
+/// - 特性 8：[TxPersistable] + [TxBaselineField] 存档向后兼容编译校验 + ToTxJson / FromTxJson
+/// - 特性 9：VTX.Res 强类型资产清单（Assets as Code）+ VTX008 路径存在性编译校验
+/// - 特性 10：TxTask.WaitSignal<T0, T1> 强类型信号参数解包等待
+/// - 特性 12：TxRandom 确定性可回滚随机数（保证 Simulate 预览与 Try 真跑掷出完全相同的随机结果）+ VTX007 红线
 /// </summary>
+[TxPersistable(version: 1)]
+[TxBaselineField("Gold", "int")]
+[TxBaselineField("Mana", "int")]
+[TxBaselineField("MaxMana", "int")]
+[TxBaselineField("EquippedWeapon", "string")]
 public partial class VtxFeatureShowcase : Node3D
 {
+    [Signal]
+    public delegate void LootDroppedEventHandler(string itemId, int quantity);
+
     // =========================================================================
-    // 0. 基础 [TxField] 状态声明 + 事务容器
-    //    TxFieldGenerator 会自动为 partial class 生成：
-    //    - 公开属性：Gold, Mana, MaxMana, EquippedWeapon, IsChanneling, ShieldVfxActive
-    //    - 快照与对比：CaptureTxSnapshot(), RestoreTxSnapshot(snap), DiffTxState(before)
-    //    - ITxObject 接口（自动在 Commit 前调用所有 [TxInvariant] 方法）
+    // 0. 基础 [TxField] 状态声明 + 事务容器 + 确定性可回滚随机数 TxRandom
     // =========================================================================
     [TxField] private int _gold = 100;
     [TxField] private int _mana = 50;
@@ -32,11 +39,10 @@ public partial class VtxFeatureShowcase : Node3D
     public TxList<string> Inventory { [Pure] get; } = new();
     public TxDict<string, int> Buffs { [Pure] get; } = new();
     public TxArray<int> BoardGrid { [Pure] get; } = new(8);
+    public TxRandom Rng { [Pure] get; } = new(seed: 123456789UL);
 
     // =========================================================================
     // 特性 4：类不变量校验（[TxInvariant]）
-    // 只要事务修改了本对象的任何 [TxField]，在最外层或子事务准备 Commit 的瞬间，
-    // 运行时会自动执行此方法。一旦违反守恒律或数值上下限，当场自动回滚整个事务！
     // =========================================================================
     [TxInvariant]
     private void CheckClassInvariants()
@@ -52,11 +58,9 @@ public partial class VtxFeatureShowcase : Node3D
     public void BuyAndDrinkPotion(string potionName, int price, int manaRestore)
     {
         Gold -= price;
-        // 特性 5：[CallerArgumentExpression] 自动捕获失败表达式 "Gold >= 0" 与自定义原因
         Tx.Check(Gold >= 0, "金币不足");
 
         Mana += manaRestore;
-        // 注意：即使这里没手写 Tx.Check(Mana <= MaxMana)，提交前 [TxInvariant] 也会自动拦截溢出并回滚！
         Buffs[potionName] = Buffs.GetOrDefault(potionName, 0) + 1;
     }
 
@@ -65,37 +69,19 @@ public partial class VtxFeatureShowcase : Node3D
     // =========================================================================
     public readonly record struct ShopOffer(string Name, int Price, int ManaRestore);
 
-    /// <summary>
-    /// 示例 1A (Tx.WhereCan)：遍历商店所有药水，在真实状态上无损试跑，
-    /// 筛出所有“买得起且喝了之后法力不会溢出 [TxInvariant] 上限”的合法商品。
-    /// </summary>
     [Pure]
-    public List<ShopOffer> GetAffordableAndValidOffers(IEnumerable<ShopOffer> offers)
-    {
-        return Tx.WhereCan(offers, offer => BuyAndDrinkPotion(offer.Name, offer.Price, offer.ManaRestore));
-    }
+    public List<ShopOffer> GetAffordableAndValidOffers(IEnumerable<ShopOffer> offers) =>
+        Tx.WhereCan(offers, offer => BuyAndDrinkPotion(offer.Name, offer.Price, offer.ManaRestore));
 
-    /// <summary>
-    /// 示例 1B (Tx.FirstOf)：按优先级尝试购买列表中的第一瓶合法药水；
-    /// 前面失败的候选会自动回滚，第一个成功的候选直接提交生效并返回 true。
-    /// </summary>
-    public bool TryBuyFirstAvailableOffer(IEnumerable<ShopOffer> priorityOffers, out ShopOffer chosen)
-    {
-        return Tx.FirstOf(
+    public bool TryBuyFirstAvailableOffer(IEnumerable<ShopOffer> priorityOffers, out ShopOffer chosen) =>
+        Tx.FirstOf(
             priorityOffers,
             offer => BuyAndDrinkPotion(offer.Name, offer.Price, offer.ManaRestore),
             out chosen);
-    }
 
     // =========================================================================
-    // 特性 2：结构化并发进阶（TxTask.Rush / WithScope + Branch / Defer）
+    // 特性 2 & 10：结构化并发（Rush / WithScope + Branch / Defer / WaitSignal<T0, T1>）
     // =========================================================================
-    /// <summary>
-    /// 演示：
-    /// 1. TxTask.Defer：进入吟唱时开启 IsChanneling = true，无论正常结束还是被取消自动归位 false；
-    /// 2. TxTask.WithScope + scope.Branch：启动后台伴随护盾特效协程，当主技能结束退出作用域时自动取消清理；
-    /// 3. TxTask.Rush：0.02s 施法前摇一结束主干立即继续，伴随的 0.04s 残影分支继续跑完。
-    /// </summary>
     [Suspends]
     public async Task<string> CastUltimateSkillAsync(CancellationToken ct = default)
     {
@@ -104,10 +90,8 @@ public partial class VtxFeatureShowcase : Node3D
         await TxTask.WithScope(async scope =>
         {
             IsChanneling = true;
-            // 1. Defer 守卫：离开此作用域（或异常/取消）时，必定恢复 IsChanneling = false
             using var _ = TxTask.Defer(() => IsChanneling = false);
 
-            // 2. Branch 伴随子任务：循环维持护盾特效，直到外层 WithScope 结束自动被取消
             scope.Branch(async branchCt =>
             {
                 ShieldVfxActive = true;
@@ -116,29 +100,32 @@ public partial class VtxFeatureShowcase : Node3D
                     ShieldVfxActive = false;
                     branchCleanedUp = true;
                 });
-                await TxTask.Sleep(10.0, branchCt); // 主流程只需 0.02s，退出 WithScope 时这里会被自动取消
+                await TxTask.Sleep(10.0, branchCt);
             });
 
-            // 3. Rush：分支 0（0.02s 核心前摇）完结即返回继续主流程，分支 1（0.03s 刀光残影）继续在后台跑
-            int rushWinner = await TxTask.Rush(
+            await TxTask.Rush(
                 scope.Token,
                 async t => await TxTask.Sleep(0.02, t),
                 async t => await TxTask.Sleep(0.03, t)
             );
         }, ct);
 
-        return $"Channeling={IsChanneling}, ShieldVfx={ShieldVfxActive}, BranchCleaned={branchCleanedUp}";
+        // 特性 10：强类型信号等待 WaitSignal<string, int>，直接解包信号参数作为返回值
+        var waitLootTask = TxTask.WaitSignal<string, int>(this, SignalName.LootDropped, ct);
+        EmitSignal(SignalName.LootDropped, "DragonScale", 3);
+        (string droppedItem, int droppedQty) = await waitLootTask;
+
+        return $"Channeling={IsChanneling}, ShieldVfx={ShieldVfxActive}, BranchCleaned={branchCleanedUp}, Loot={droppedItem}x{droppedQty}";
     }
 
     // =========================================================================
-    // 特性 3：自动生成的强类型快照与状态 Diff（CaptureTxSnapshot / DiffTxState）
+    // 特性 3 & 8：自动快照 Diff + JSON 持久化序列化（ToTxJson / FromTxJson）
     // =========================================================================
-    public string DemoAutoSnapshotAndDiff()
+    public string DemoAutoSnapshotDiffAndPersistence()
     {
-        // 1. 编译期自动生成的 CaptureTxSnapshot()，无需手写字符串拼接
         VtxFeatureShowcaseTxSnapshot before = CaptureTxSnapshot();
+        string savedJson = ToTxJson();
 
-        // 2. 执行一次事务修改
         bool ok = Tx.Try(() =>
         {
             Gold -= 35;
@@ -146,13 +133,56 @@ public partial class VtxFeatureShowcase : Node3D
             EquippedWeapon = "DragonSpear";
         });
 
-        // 3. 编译期自动生成的 DiffTxState(before)，直接输出结构化字段变更摘要
         string diff = DiffTxState(before);
 
-        // 4. 还可以随时用 RestoreTxSnapshot(before) 一键还原（同样支持在事务内还原！）
-        RestoreTxSnapshot(before);
+        // 通过自动生成的 FromTxJson 在事务内恢复存档（同样受 [TxInvariant] 保护）
+        bool restoredOk = Tx.Try(() => FromTxJson(savedJson));
 
-        return $"Ok={ok} | Diff=[{diff}] | RestoredGold={Gold}";
+        return $"Ok={ok} | Restored={restoredOk} | Diff=[{diff}] | GoldAfterRestore={Gold}";
+    }
+
+    // =========================================================================
+    // 特性 9：强类型资产引用（VTX.Res）
+    // =========================================================================
+    [Pure]
+    public string DemoStronglyTypedAssetRegistry()
+    {
+        // 由 TxFieldGenerator 扫描项目目录自动生成的强类型常量，改名或删除会在编译期报错
+        string scenePath = Res.Scenes.Player;
+        string shaderPath = Res.Shaders.Player;
+        string iconPath = Res.Textures.Icon;
+        return $"Scene={scenePath}, Shader={shaderPath}, Icon={iconPath}";
+    }
+
+    // =========================================================================
+    // 特性 12：确定性可回滚随机数（TxRandom）
+    // =========================================================================
+    [Decides]
+    public int RollForgeEnhancement(int goldCost)
+    {
+        Gold -= goldCost;
+        Tx.Check(Gold >= 0, "强化金币不足");
+
+        // 使用 TxRandom 生成随机暴击倍率：
+        // 若在 Simulate 中预览，种子会在预览结束后自动回退；紧接着调 Try 会掷出完全相同的点数！
+        int bonus = Rng.NextInt(10, 100);
+        return bonus;
+    }
+
+    public bool VerifyDeterministicRollBetweenSimulateAndTry()
+    {
+        ulong initialSeed = Rng.State;
+
+        // 1. 先用 Simulate 沙盒预览下一次强化会掷出多少点加成
+        bool canRoll = Tx.Simulate(() => RollForgeEnhancement(20), out int previewBonus);
+        // Simulate 结束后，Rng.State 已自动回滚回 initialSeed，Gold 仍为 100
+        bool seedRewound = Rng.State == initialSeed && Gold == 100;
+
+        // 2. 再用 Try 真正执行强化：因为种子已回退到同一位置，掷出的加成与预览 100% 相同！
+        bool committed = Tx.Try(() => RollForgeEnhancement(20), out int actualBonus);
+        Gold = 100; // 还原金币供后续测试
+
+        return canRoll && seedRewound && committed && previewBonus == actualBonus;
     }
 
     // =========================================================================
@@ -169,7 +199,7 @@ public partial class VtxFeatureShowcase : Node3D
     }
 
     // =========================================================================
-    // 综合自检入口（验证全部 5 项新特性）
+    // 综合自检入口
     // =========================================================================
     public string RunAllNewFeaturesSelfTest()
     {
@@ -180,35 +210,38 @@ public partial class VtxFeatureShowcase : Node3D
 
         var offers = new[]
         {
-            new ShopOffer("TooExpensiveElixir", Price: 250, ManaRestore: 10), // 失败：金币不足 (Gold >= 0)
-            new ShopOffer("OverflowManaPotion", Price: 20, ManaRestore: 80),  // 失败：50+80=130 触发 [TxInvariant] 法力上限回滚！
-            new ShopOffer("ValidMinorManaPotion", Price: 30, ManaRestore: 25) // 成功：Gold=70, Mana=75
+            new ShopOffer("TooExpensiveElixir", Price: 250, ManaRestore: 10),
+            new ShopOffer("OverflowManaPotion", Price: 20, ManaRestore: 80),
+            new ShopOffer("ValidMinorManaPotion", Price: 30, ManaRestore: 25)
         };
 
-        // 验证特性 5 (Failure Reason) & 特性 4 ([TxInvariant] 自动拦截法力溢出并回滚 Gold)
         string reason0 = DiagnoseWhyCannotBuy(offers[0]);
         string reason1 = DiagnoseWhyCannotBuy(offers[1]);
         bool invariantRolledBackGold = Gold == 100 && Mana == 50;
 
-        // 验证特性 1A (Tx.WhereCan 无损筛选合法商品)
         List<ShopOffer> validOffers = GetAffordableAndValidOffers(offers);
         bool whereCanOk = validOffers.Count == 1 && validOffers[0].Name == "ValidMinorManaPotion" && Gold == 100;
 
-        // 验证特性 1B (Tx.FirstOf 自动回溯前两个失败项并提交第 3 个)
         bool firstOfOk = TryBuyFirstAvailableOffer(offers, out ShopOffer chosen) &&
                          chosen.Name == "ValidMinorManaPotion" &&
                          Gold == 70 &&
                          Mana == 75;
 
-        // 验证特性 3 (自动生成的 Snapshot 与 DiffTxState)
         Gold = 100;
         Mana = 50;
-        string diffReport = DemoAutoSnapshotAndDiff();
-        bool diffOk = diffReport.Contains("Gold: 100 -> 65") &&
-                      diffReport.Contains("EquippedWeapon: WoodenSword -> DragonSpear") &&
-                      Gold == 100;
+        string diffReport = DemoAutoSnapshotDiffAndPersistence();
+        bool diffAndPersistOk = diffReport.Contains("Gold: 100 -> 65") &&
+                                diffReport.Contains("Restored=True") &&
+                                Gold == 100;
 
-        return $"[VTX 5-Features] InvariantRollback={invariantRolledBackGold} ({reason1}) | " +
-               $"FailTrace=({reason0}) | WhereCan={whereCanOk} | FirstOf={firstOfOk} | AutoDiff={diffOk} ({diffReport})";
+        bool rngDeterministicOk = VerifyDeterministicRollBetweenSimulateAndTry();
+        string assetsInfo = DemoStronglyTypedAssetRegistry();
+        bool assetsOk = assetsInfo.Contains("res://demo/player.tscn") &&
+                        assetsInfo.Contains("res://demo/player.gdshader") &&
+                        assetsInfo.Contains("res://icon.svg");
+
+        return $"[VTX Full Showcase] Invariant={invariantRolledBackGold} | FailTrace=({reason0}) | " +
+               $"WhereCan={whereCanOk} | FirstOf={firstOfOk} | Persist&Diff={diffAndPersistOk} | " +
+               $"DetermRng={rngDeterministicOk} | AssetsAsCode={assetsOk} ({assetsInfo})";
     }
 }

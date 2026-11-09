@@ -1,9 +1,15 @@
+using System;
+using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.IO;
 using System.Linq;
+using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
+
+#pragma warning disable RS1035 // Allow checking res:// asset paths and vtx.schema.json on disk
 
 namespace Godot.SourceGenerators
 {
@@ -58,6 +64,30 @@ namespace Godot.SourceGenerators
             defaultSeverity: DiagnosticSeverity.Error,
             isEnabledByDefault: true);
 
+        public static readonly DiagnosticDescriptor RuleNonDeterministicCall = new DiagnosticDescriptor(
+            id: "VTX007",
+            title: "事务或 [Pure] 内禁止调用非确定性或不可回滚的随机/时间源",
+            messageFormat: "事务或 [Pure] 上下文内禁止调用非确定性源 '{0}'（会导致 Tx.Simulate 试跑与 Tx.Try 真跑结果不一致且无法回滚种子）。请改用 'TxRandom'，或在事务外生成后作为参数传入。",
+            category: "VTX",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        public static readonly DiagnosticDescriptor RuleInvalidResPath = new DiagnosticDescriptor(
+            id: "VTX008",
+            title: "res:// 资源路径在项目中不存在",
+            messageFormat: "资源路径 '{0}' 在项目磁盘中不存在！请使用编译期生成的 'VTX.Res' 强类型常量，或检查路径拼写。",
+            category: "VTX",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        public static readonly DiagnosticDescriptor RulePersistableSchemaBreak = new DiagnosticDescriptor(
+            id: "VTX009",
+            title: "[TxPersistable] 类破坏了存档 Schema 向后兼容性",
+            messageFormat: "[TxPersistable] 类 '{0}' 破坏了存档向后兼容性：基线字段 '{1} ({2})' {3}。请保留该 [TxField] 字段与原类型，或新增字段进行平滑迁移。",
+            category: "VTX",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
         public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics =>
             ImmutableArray.Create(
                 RuleNonTxMutation,
@@ -65,13 +95,17 @@ namespace Godot.SourceGenerators
                 RuleNoSuspendInTx,
                 RuleDirectTxFieldWrite,
                 RuleRawToSignalInSuspends,
-                RuleMutableCollectionInTxField);
+                RuleMutableCollectionInTxField,
+                RuleNonDeterministicCall,
+                RuleInvalidResPath,
+                RulePersistableSchemaBreak);
 
         public override void Initialize(AnalysisContext context)
         {
             context.ConfigureGeneratedCodeAnalysis(GeneratedCodeAnalysisFlags.None);
             context.EnableConcurrentExecution();
 
+            context.RegisterSyntaxNodeAction(AnalyzeClassDeclaration, SyntaxKind.ClassDeclaration);
             context.RegisterSyntaxNodeAction(AnalyzeFieldDeclaration, SyntaxKind.FieldDeclaration);
             context.RegisterSyntaxNodeAction(AnalyzeMethodDeclaration, SyntaxKind.MethodDeclaration);
             context.RegisterSyntaxNodeAction(AnalyzeAssignment,
@@ -95,7 +129,166 @@ namespace Godot.SourceGenerators
                 SyntaxKind.PostDecrementExpression);
 
             context.RegisterSyntaxNodeAction(AnalyzeInvocation, SyntaxKind.InvocationExpression);
+            context.RegisterSyntaxNodeAction(AnalyzeMemberAccess, SyntaxKind.SimpleMemberAccessExpression);
             context.RegisterSyntaxNodeAction(AnalyzeAwait, SyntaxKind.AwaitExpression);
+            context.RegisterSyntaxNodeAction(AnalyzeStringLiteral, SyntaxKind.StringLiteralExpression);
+        }
+
+        private static void AnalyzeClassDeclaration(SyntaxNodeAnalysisContext context)
+        {
+            var classDecl = (ClassDeclarationSyntax)context.Node;
+            if (classDecl.AttributeLists.Count == 0)
+                return;
+
+            if (context.SemanticModel.GetDeclaredSymbol(classDecl, context.CancellationToken) is not INamedTypeSymbol classSym)
+                return;
+
+            // Only run schema check on the partial declaration that carries [TxPersistable]
+            bool hasPersistableHere = false;
+            foreach (var list in classDecl.AttributeLists)
+            {
+                foreach (var attrSyntax in list.Attributes)
+                {
+                    if (context.SemanticModel.GetSymbolInfo(attrSyntax, context.CancellationToken).Symbol is IMethodSymbol ctor &&
+                        ctor.ContainingType?.Name is "TxPersistableAttribute" or "TxPersistable")
+                    {
+                        hasPersistableHere = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!hasPersistableHere)
+                return;
+
+            // Collect all current [TxField] properties on this class
+            var currentFields = new Dictionary<string, (string shortType, string fullType)>(StringComparer.Ordinal);
+            foreach (var member in classSym.GetMembers().OfType<IFieldSymbol>())
+            {
+                if (!HasAttribute(member, "TxFieldAttribute", "TxField"))
+                    continue;
+
+                string propName = GetTxFieldPropertyName(member);
+                string shortType = member.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
+                string fullType = member.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+                currentFields[propName] = (shortType, fullType);
+            }
+
+            // 1. Check [TxBaselineField("PropName", "TypeName")] attributes
+            foreach (var attr in classSym.GetAttributes())
+            {
+                if (attr.AttributeClass?.Name is not ("TxBaselineFieldAttribute" or "TxBaselineField"))
+                    continue;
+
+                if (attr.ConstructorArguments.Length < 2)
+                    continue;
+
+                string? baseProp = attr.ConstructorArguments[0].Value as string;
+                string? baseType = attr.ConstructorArguments[1].Value as string;
+                if (string.IsNullOrEmpty(baseProp) || string.IsNullOrEmpty(baseType))
+                    continue;
+
+                VerifyBaselineField(context, classDecl.Identifier.GetLocation(), classSym.Name, baseProp!, baseType!, currentFields);
+            }
+
+            // 2. Also check vtx.schema.json in GodotProjectDir if present (format: lines of "ClassName|Prop1:Type1|Prop2:Type2")
+            string? projectDir = TryGetProjectDir(context);
+            if (!string.IsNullOrEmpty(projectDir))
+            {
+                string schemaFile = Path.Combine(projectDir!, "vtx.schema.txt");
+                if (File.Exists(schemaFile))
+                {
+                    try
+                    {
+                        foreach (var rawLine in File.ReadAllLines(schemaFile))
+                        {
+                            string line = rawLine.Trim();
+                            if (line.Length == 0 || line.StartsWith("#"))
+                                continue;
+
+                            string[] parts = line.Split('|');
+                            if (parts.Length < 2 || parts[0] != classSym.Name)
+                                continue;
+
+                            for (int i = 1; i < parts.Length; i++)
+                            {
+                                int colon = parts[i].IndexOf(':');
+                                if (colon <= 0) continue;
+                                string bProp = parts[i].Substring(0, colon).Trim();
+                                string bType = parts[i].Substring(colon + 1).Trim();
+                                VerifyBaselineField(context, classDecl.Identifier.GetLocation(), classSym.Name, bProp, bType, currentFields);
+                            }
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+        }
+
+        private static void VerifyBaselineField(
+            SyntaxNodeAnalysisContext context,
+            Location location,
+            string className,
+            string baseProp,
+            string baseType,
+            Dictionary<string, (string shortType, string fullType)> currentFields)
+        {
+            if (!currentFields.TryGetValue(baseProp, out var actual))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(
+                    RulePersistableSchemaBreak,
+                    location,
+                    className,
+                    baseProp,
+                    baseType,
+                    "已被删除或重命名"));
+                return;
+            }
+
+            if (!string.Equals(actual.shortType, baseType, StringComparison.Ordinal) &&
+                !string.Equals(actual.fullType, baseType, StringComparison.Ordinal))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(
+                    RulePersistableSchemaBreak,
+                    location,
+                    className,
+                    baseProp,
+                    baseType,
+                    $"类型被修改为 '{actual.shortType}'"));
+            }
+        }
+
+        private static void AnalyzeStringLiteral(SyntaxNodeAnalysisContext context)
+        {
+            var literal = (LiteralExpressionSyntax)context.Node;
+            string text = literal.Token.ValueText;
+
+            if (!text.StartsWith("res://", StringComparison.Ordinal))
+                return;
+
+            // Ignore bare "res://" prefix or editor/plugin internal dynamic paths
+            string rel = text.Substring("res://".Length);
+            if (string.IsNullOrWhiteSpace(rel) ||
+                rel.StartsWith(".", StringComparison.Ordinal) ||
+                rel.StartsWith("addons/", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            string? projectDir = TryGetProjectDir(context);
+            if (string.IsNullOrEmpty(projectDir) || !Directory.Exists(projectDir))
+                return;
+
+            string fullPath = Path.Combine(projectDir!, rel.Replace('/', Path.DirectorySeparatorChar));
+            if (!File.Exists(fullPath) && !Directory.Exists(fullPath))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(
+                    RuleInvalidResPath,
+                    literal.GetLocation(),
+                    text));
+            }
         }
 
         private static void AnalyzeFieldDeclaration(SyntaxNodeAnalysisContext context)
@@ -282,6 +475,30 @@ namespace Godot.SourceGenerators
             }
         }
 
+        private static void AnalyzeMemberAccess(SyntaxNodeAnalysisContext context)
+        {
+            var memberAccess = (MemberAccessExpressionSyntax)context.Node;
+            if (context.SemanticModel.GetSymbolInfo(memberAccess, context.CancellationToken).Symbol is not IPropertySymbol propSymbol)
+                return;
+
+            string typeFull = propSymbol.ContainingType?.ToDisplayString() ?? string.Empty;
+            bool isNonDeterministicProp =
+                (typeFull is "System.DateTime" or "System.DateTimeOffset" && propSymbol.Name is "Now" or "UtcNow") ||
+                (typeFull == "System.Environment" && propSymbol.Name is "TickCount" or "TickCount64");
+
+            if (!isNonDeterministicProp)
+                return;
+
+            if (FindEnclosingTransactionalScope(context.SemanticModel, memberAccess) != null ||
+                IsInsidePureMethod(context.SemanticModel, memberAccess))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(
+                    RuleNonDeterministicCall,
+                    memberAccess.GetLocation(),
+                    $"{propSymbol.ContainingType?.Name}.{propSymbol.Name}"));
+            }
+        }
+
         private static void AnalyzeInvocation(SyntaxNodeAnalysisContext context)
         {
             var invocation = (InvocationExpressionSyntax)context.Node;
@@ -296,8 +513,19 @@ namespace Godot.SourceGenerators
                     invocation.GetLocation()));
             }
 
-            // Check if inside transactional context
             SyntaxNode? txScopeNode = FindEnclosingTransactionalScope(context.SemanticModel, invocation);
+            bool inPure = IsInsidePureMethod(context.SemanticModel, invocation);
+
+            // Check VTX007: Non-deterministic random / time / guid calls inside transaction or [Pure]
+            if ((txScopeNode != null || inPure) && IsNonDeterministicMethod(methodSymbol))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(
+                    RuleNonDeterministicCall,
+                    invocation.GetLocation(),
+                    $"{methodSymbol.ContainingType?.Name}.{methodSymbol.Name}"));
+                return;
+            }
+
             if (txScopeNode == null)
                 return;
 
@@ -328,6 +556,24 @@ namespace Godot.SourceGenerators
                 RuleEffectViolation,
                 invocation.GetLocation(),
                 $"{methodSymbol.ContainingType?.Name}.{methodSymbol.Name}"));
+        }
+
+        private static bool IsNonDeterministicMethod(IMethodSymbol method)
+        {
+            string typeFull = method.ContainingType?.ToDisplayString() ?? string.Empty;
+            if (typeFull is "System.Random" or "System.Security.Cryptography.RandomNumberGenerator")
+                return true;
+
+            if (typeFull == "System.Guid" && method.Name == "NewGuid")
+                return true;
+
+            if (typeFull == "Godot.GD" &&
+                method.Name is "Randf" or "Randi" or "Randfn" or "RandRange" or "Randomize" or "Seed")
+            {
+                return true;
+            }
+
+            return false;
         }
 
         private static void AnalyzeAwait(SyntaxNodeAnalysisContext context)
@@ -370,7 +616,7 @@ namespace Godot.SourceGenerators
 
             string typeFullName = containingType.OriginalDefinition.ToDisplayString();
 
-            if (typeFullName is "VTX.Tx" or "VTX.TxGodot")
+            if (typeFullName is "VTX.Tx" or "VTX.TxGodot" or "VTX.TxRandom")
                 return true;
 
             if (typeFullName is
@@ -457,7 +703,7 @@ namespace Godot.SourceGenerators
             if (type == null)
                 return false;
             string ns = type.ContainingNamespace?.ToDisplayString() ?? string.Empty;
-            return ns == "VTX" && type.Name is "Tx" or "TxArray" or "TxList" or "TxDict" or "TxGodot" or "TxTask" or "TxScope";
+            return ns == "VTX" && type.Name is "Tx" or "TxArray" or "TxList" or "TxDict" or "TxGodot" or "TxTask" or "TxScope" or "TxRandom";
         }
 
         private static bool IsInsideSuspendsMethod(SemanticModel model, SyntaxNode node)
@@ -477,6 +723,50 @@ namespace Godot.SourceGenerators
                 }
             }
             return false;
+        }
+
+        private static bool IsInsidePureMethod(SemanticModel model, SyntaxNode node)
+        {
+            for (SyntaxNode? cur = node.Parent; cur != null; cur = cur.Parent)
+            {
+                if (cur is MethodDeclarationSyntax methodDecl &&
+                    model.GetDeclaredSymbol(methodDecl) is IMethodSymbol methodSym)
+                {
+                    if (IsTrustedRuntimeType(methodSym.ContainingType))
+                        return false;
+                    return HasAttribute(methodSym, "PureAttribute", "Pure");
+                }
+                if (cur is AccessorDeclarationSyntax accessorDecl &&
+                    model.GetDeclaredSymbol(accessorDecl) is IMethodSymbol accessorSym)
+                {
+                    if (IsTrustedRuntimeType(accessorSym.ContainingType))
+                        return false;
+                    return HasAttribute(accessorSym, "PureAttribute", "Pure");
+                }
+            }
+            return false;
+        }
+
+        private static string? TryGetProjectDir(SyntaxNodeAnalysisContext context)
+        {
+            var opts = context.Options.AnalyzerConfigOptionsProvider.GlobalOptions;
+            if (opts.TryGetValue("build_property.GodotProjectDirBase64", out string? b64) && !string.IsNullOrEmpty(b64))
+            {
+                try
+                {
+                    return Encoding.UTF8.GetString(Convert.FromBase64String(b64));
+                }
+                catch
+                {
+                }
+            }
+
+            if (opts.TryGetValue("build_property.GodotProjectDir", out string? dir) && !string.IsNullOrEmpty(dir))
+            {
+                return dir;
+            }
+
+            return null;
         }
 
         private static ISymbol? GetRootSymbol(SemanticModel model, ExpressionSyntax expr)

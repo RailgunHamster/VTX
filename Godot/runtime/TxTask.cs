@@ -252,6 +252,164 @@ public static class TxTask
     }
 
     /// <summary>
+    /// 带 1 个强类型参数返回值的可取消信号等待（对应 Verse 的 Event.Await()）：
+    /// 当信号触发时，直接将信号携带的第 1 个参数作为 Task&lt;T0&gt; 返回值解包返回；
+    /// 若被 Race 或父作用域取消，自动从 GodotObject 退订信号。
+    /// </summary>
+    [Suspends]
+    public static Task<T0> WaitSignal<[MustBeVariant] T0>(
+        GodotObject source,
+        StringName signalName,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(signalName);
+
+        if (ct.IsCancellationRequested)
+            return Task.FromCanceled<T0>(ct);
+
+        var tcs = new TaskCompletionSource<T0>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Callable callable = default;
+        CancellationTokenRegistration reg = default;
+        bool disconnected = false;
+
+        void DisconnectSafe()
+        {
+            if (disconnected)
+                return;
+            disconnected = true;
+            reg.Dispose();
+            if (GodotObject.IsInstanceValid(source) && source.IsConnected(signalName, callable))
+            {
+                source.Disconnect(signalName, callable);
+            }
+        }
+
+        callable = Callable.From<T0>(arg0 =>
+        {
+            DisconnectSafe();
+            tcs.TrySetResult(arg0);
+        });
+
+        source.Connect(signalName, callable);
+
+        if (ct.CanBeCanceled)
+        {
+            reg = ct.Register(() =>
+            {
+                DisconnectSafe();
+                tcs.TrySetCanceled(ct);
+            });
+        }
+
+        return tcs.Task;
+    }
+
+    /// <summary>
+    /// 带 2 个强类型参数返回值的可取消信号等待：信号触发时直接返回元组 (T0, T1)。
+    /// </summary>
+    [Suspends]
+    public static Task<(T0, T1)> WaitSignal<[MustBeVariant] T0, [MustBeVariant] T1>(
+        GodotObject source,
+        StringName signalName,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(signalName);
+
+        if (ct.IsCancellationRequested)
+            return Task.FromCanceled<(T0, T1)>(ct);
+
+        var tcs = new TaskCompletionSource<(T0, T1)>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Callable callable = default;
+        CancellationTokenRegistration reg = default;
+        bool disconnected = false;
+
+        void DisconnectSafe()
+        {
+            if (disconnected)
+                return;
+            disconnected = true;
+            reg.Dispose();
+            if (GodotObject.IsInstanceValid(source) && source.IsConnected(signalName, callable))
+            {
+                source.Disconnect(signalName, callable);
+            }
+        }
+
+        callable = Callable.From<T0, T1>((arg0, arg1) =>
+        {
+            DisconnectSafe();
+            tcs.TrySetResult((arg0, arg1));
+        });
+
+        source.Connect(signalName, callable);
+
+        if (ct.CanBeCanceled)
+        {
+            reg = ct.Register(() =>
+            {
+                DisconnectSafe();
+                tcs.TrySetCanceled(ct);
+            });
+        }
+
+        return tcs.Task;
+    }
+
+    /// <summary>
+    /// 带 3 个强类型参数返回值的可取消信号等待：信号触发时直接返回元组 (T0, T1, T2)。
+    /// </summary>
+    [Suspends]
+    public static Task<(T0, T1, T2)> WaitSignal<[MustBeVariant] T0, [MustBeVariant] T1, [MustBeVariant] T2>(
+        GodotObject source,
+        StringName signalName,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(signalName);
+
+        if (ct.IsCancellationRequested)
+            return Task.FromCanceled<(T0, T1, T2)>(ct);
+
+        var tcs = new TaskCompletionSource<(T0, T1, T2)>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Callable callable = default;
+        CancellationTokenRegistration reg = default;
+        bool disconnected = false;
+
+        void DisconnectSafe()
+        {
+            if (disconnected)
+                return;
+            disconnected = true;
+            reg.Dispose();
+            if (GodotObject.IsInstanceValid(source) && source.IsConnected(signalName, callable))
+            {
+                source.Disconnect(signalName, callable);
+            }
+        }
+
+        callable = Callable.From<T0, T1, T2>((arg0, arg1, arg2) =>
+        {
+            DisconnectSafe();
+            tcs.TrySetResult((arg0, arg1, arg2));
+        });
+
+        source.Connect(signalName, callable);
+
+        if (ct.CanBeCanceled)
+        {
+            reg = ct.Register(() =>
+            {
+                DisconnectSafe();
+                tcs.TrySetCanceled(ct);
+            });
+        }
+
+        return tcs.Task;
+    }
+
+    /// <summary>
     /// 结构化并发 Race：所有分支同时启动，第一个完成的分支获胜，
     /// 其余落败分支立即收到 CancellationToken 取消信号并等待其 Defer/finally 块清理完毕后返回获胜分支下标。
     /// </summary>

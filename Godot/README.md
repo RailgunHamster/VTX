@@ -13,14 +13,15 @@ Godot/
 │   ├── AI_GUIDE.md             # 人类与 AI Agent 编写规范与排错手册（可直接被项目 AGENTS.md 引用）
 │   └── Examples.cs             # 涵盖全部 VTX 特性的完整可编译代码示例
 ├── runtime/                    # 链接编译进 GodotSharp.dll (namespace VTX)
-│   ├── VtxAttributes.cs        # [TxField], [Transacts], [Decides], [Suspends], [Pure], [NoRollback]
-│   ├── Tx.cs                   # 事务运行时：Tx.Try, Tx.Simulate, Tx.Check, Tx.Fail, Tx.Record, Tx.Defer
+│   ├── VtxAttributes.cs        # [TxField], [TxInvariant], [TxPersistable], [Transacts], [Decides], [Suspends], [Pure], [NoRollback]
+│   ├── Tx.cs                   # 事务运行时：Tx.Try, Tx.Simulate, Tx.FirstOf, Tx.WhereCan, Tx.Check, Tx.NotNull, Tx.Record, Tx.Defer
 │   ├── TxCollections.cs        # O(1) 增量回滚容器：TxArray<T>, TxList<T>, TxDict<TKey, TValue>
+│   ├── TxRandom.cs             # 确定性可回滚伪随机数生成器（保证 Simulate 预览与 Try 真跑结果一致）
 │   ├── TxGodot.cs              # Godot 节点事务安全封装：SetPosition/Rotation/Visible + 延迟节点树/信号操作
-│   └── TxTask.cs               # 帧同步结构化并发：Race, Sync, Sleep(游戏时间), WaitSignal(可取消)
+│   └── TxTask.cs               # 帧同步结构化并发：Race, Sync, Rush, WithScope+Branch, Defer, Sleep, WaitSignal<T>
 └── analyzers/                  # 链接编译进 Godot.SourceGenerators.dll
-    ├── TxFieldGenerator.cs     # 扫描 [TxField] 自动生成带 Undo Log 的公开属性
-    └── VtxAnalyzer.cs          # Roslyn 静态分析器（强制拦截 VTX001 ~ VTX006）
+    ├── TxFieldGenerator.cs     # [TxField] 属性/快照/Diff/JSON 生成器 + VTX.Res 强类型资产清单生成器
+    └── VtxAnalyzer.cs          # Roslyn 静态分析器（强制拦截 VTX001 ~ VTX009）
 ```
 
 ---

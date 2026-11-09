@@ -4,7 +4,7 @@ using System;
 namespace VTX;
 
 /// <summary>
-/// 由 [TxField] 源码生成器自动实现的接口，用于支持提交前类不变量（[TxInvariant]）自动校验。
+/// 由 [TxField] 源码生成器自动实现的接口，用于支持提交前类不变量（[TxInvariant]）自动校验与持久化。
 /// </summary>
 public interface ITxObject
 {
@@ -18,7 +18,8 @@ public interface ITxObject
 /// 编译器 Source Generator 会自动生成：
 /// 1. 带 Undo Log 记录的同名公开属性（如 public int Gold）；
 /// 2. 强类型快照结构体 TxSnapshot 及 CaptureTxSnapshot() / RestoreTxSnapshot() / DiffTxState() 方法；
-/// 3. ITxObject 接口实现（联动 [TxInvariant] 在事务提交前自动校验）。
+/// 3. JSON 持久化方法 ToTxJson() / FromTxJson(json)；
+/// 4. ITxObject 接口实现（联动 [TxInvariant] 在事务提交前自动校验）。
 /// </summary>
 [AttributeUsage(AttributeTargets.Field, Inherited = false, AllowMultiple = false)]
 public sealed class TxFieldAttribute : Attribute
@@ -34,6 +35,35 @@ public sealed class TxFieldAttribute : Attribute
 /// </summary>
 [AttributeUsage(AttributeTargets.Method, Inherited = true, AllowMultiple = false)]
 public sealed class TxInvariantAttribute : Attribute { }
+
+/// <summary>
+/// 标记 partial class 为跨会话持久化对象（对应 Verse 的 &lt;persistable&gt;）。
+/// 配合项目根目录的 vtx.schema.json 或类上的 [TxBaselineField] 契约，
+/// 编译器会静态检查该类的 [TxField] 属性是否破坏了旧存档向后兼容性（删除已持久化字段或篡改字段类型将触发 VTX009 编译错误）。
+/// </summary>
+[AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
+public sealed class TxPersistableAttribute : Attribute
+{
+    public int Version { get; }
+    public TxPersistableAttribute(int version = 1) => Version = version;
+}
+
+/// <summary>
+/// 声明 [TxPersistable] 类在历史已发布版本中的基线字段名与类型契约（如 [TxBaselineField("Gold", "int")]）。
+/// 若后续 AI 或开发者在迭代时误删了该 [TxField] 或将其类型改为不兼容类型，编译器将立即报 VTX009 错误。
+/// </summary>
+[AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = true)]
+public sealed class TxBaselineFieldAttribute : Attribute
+{
+    public string PropertyName { get; }
+    public string TypeName { get; }
+
+    public TxBaselineFieldAttribute(string propertyName, string typeName)
+    {
+        PropertyName = propertyName;
+        TypeName = typeName;
+    }
+}
 
 /// <summary>
 /// 标记方法或属性访问器在事务中可安全回滚。
