@@ -1,6 +1,7 @@
 #nullable enable
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Godot;
@@ -33,6 +34,162 @@ internal static class TaskTests
 
     public static void Register()
     {
+        T.Add("TxTask.NextFrame / DelayFrames / NextPhysicsFrame：按帧推进，暂停时不计数", () =>
+        {
+            Start();
+            long f0 = 0, f1 = 0, f3 = 0, p0 = 0, p1 = 0;
+            var t = Run(async () =>
+            {
+                f0 = TxTask.GameFrames;
+                await TxTask.NextFrame();
+                f1 = TxTask.GameFrames;
+                await TxTask.DelayFrames(3);
+                f3 = TxTask.GameFrames;
+                p0 = TxTask.PhysicsFrames;
+                await TxTask.NextPhysicsFrame();
+                p1 = TxTask.PhysicsFrames;
+            });
+            Completed(t, "帧等待");
+            T.Eq(1L, f1 - f0, "NextFrame 恰好一帧");
+            T.Eq(3L, f3 - f1, "DelayFrames(3) 恰好三帧");
+            T.True(p1 > p0, "NextPhysicsFrame 等到了物理帧");
+            T.True(TxTask.DelayFrames(0).IsCompleted, "0 帧立即完成");
+
+            bool done = false;
+            t = Run(async () =>
+            {
+                Engine.Tree!.Paused = true;
+                var w = TxTask.DelayFrames(2).ContinueWith(_ => done = true, TaskScheduler.FromCurrentSynchronizationContext());
+                await TxTask.SleepIgnoringPause(0.2);
+                T.True(!done, "暂停期间帧不计数");
+                Engine.Tree!.Paused = false;
+                await w;
+            });
+            Completed(t, "暂停帧");
+            T.True(done, "恢复后完成");
+        });
+
+        T.Add("TxTask.WaitUntil：立即满足同步完成；每帧检查；条件抛异常则失败；可取消", () =>
+        {
+            Start();
+            T.True(TxTask.WaitUntil(() => true).IsCompleted, "立即满足");
+            int counter = 0;
+            long startFrame = 0, endFrame = 0;
+            var t = Run(async () =>
+            {
+                startFrame = TxTask.GameFrames;
+                await TxTask.WaitUntil(() => ++counter >= 5);
+                endFrame = TxTask.GameFrames;
+            });
+            Completed(t, "WaitUntil");
+            T.Eq(5, counter, "检查了 5 次（第一次是同步检查）");
+            T.Eq(4L, endFrame - startFrame, "之后每帧检查一次");
+
+            Exception? caught = null;
+            t = Run(async () =>
+            {
+                try { await TxTask.WaitUntil(() => throw new InvalidOperationException("bad")); } catch (Exception ex) { caught = ex; }
+                int n = 0;
+                try { await TxTask.WaitUntil(() => { n++; return n > 1 && n < 0; }, new CancellationTokenSource(30).Token); } catch (Exception ex2) { caught = ex2 is OperationCanceledException ? ex2 : caught; }
+            });
+            Completed(t, "WaitUntil 异常/取消");
+            T.True(caught is OperationCanceledException, $"可取消（实际 {caught?.GetType().Name}）");
+            T.Eq(0, TxTask.ActiveWaitCount, "无残留等待");
+        });
+
+        T.Add("TxTask.LifetimeOf：QueueFree / Free 时取消，重新挂载不取消，同一节点同一令牌", () =>
+        {
+            Start();
+            var node = new Node();
+            var token = TxTask.LifetimeOf(node);
+            T.True(token.Equals(TxTask.LifetimeOf(node)), "同一节点返回同一令牌");
+            node.TestExitTree();
+            T.True(!token.IsCancellationRequested, "只是离开场景树不取消");
+
+            bool cleaned = false;
+            Exception? caught = null;
+            var t = Run(async () =>
+            {
+                var loop = (Func<Task>)(async () =>
+                {
+                    using var _ = TxTask.Defer(() => cleaned = true);
+                    await TxTask.Sleep(100, token);
+                });
+                var running = loop();
+                await TxTask.NextFrame();
+                node.QueueFree();
+                T.True(!token.IsCancellationRequested, "QueueFree 当帧还没轮询");
+                node.TestDeleteQueued(); // 帧末真正删除时会先发出 tree_exiting
+                T.True(token.IsCancellationRequested, "删除时立即取消");
+                try { await running; } catch (Exception ex) { caught = ex; }
+            });
+            Completed(t, "LifetimeOf");
+            T.True(cleaned, "协程的 Defer 已执行");
+            T.True(caught is OperationCanceledException, "协程以取消结束");
+
+            var other = new Node();
+            var token2 = TxTask.LifetimeOf(other);
+            t = Run(async () =>
+            {
+                other.Free();
+                await TxTask.NextFrame();
+                await TxTask.NextFrame();
+            });
+            Completed(t, "Free");
+            T.True(token2.IsCancellationRequested, "直接 Free 的节点下一帧取消");
+            T.True(TxTask.LifetimeOf(other).IsCancellationRequested, "已释放节点返回已取消令牌");
+        });
+
+        T.Add("TxTask.Forget：发出去不管的任务异常会被报告，取消不会", () =>
+        {
+            Start();
+            var t = Run(async () =>
+            {
+                Fail().Forget();
+                Cancelled().Forget();
+                await TxTask.NextFrame();
+                await TxTask.NextFrame();
+            });
+            Completed(t, "Forget");
+            T.True(GD.Errors.Exists(e => e.Contains("forgotten boom")), "异常已报告");
+            T.Eq(1, GD.Errors.Count, "取消不报告");
+
+            static async Task Fail() { await TxTask.NextFrame(); throw new InvalidOperationException("forgotten boom"); }
+            static async Task Cancelled() { await TxTask.NextFrame(); throw new OperationCanceledException(); }
+        });
+
+        T.Add("TxTask.GetActiveWaits：列出挂起中的等待并可记录调用栈", () =>
+        {
+            Start();
+            TxTask.TrackStackTraces = true;
+            try
+            {
+                var cts = new CancellationTokenSource();
+                IReadOnlyList<TxWaitInfo>? snapshot = null;
+                var t = Run(async () =>
+                {
+                    var a = TxTask.Sleep(5, cts.Token);
+                    var b = TxTask.DelayFrames(100, cts.Token);
+                    var c = TxTask.WaitUntil(() => false, cts.Token);
+                    var d = TxTask.WaitSignal(new GodotObject(), "never", cts.Token);
+                    await TxTask.NextFrame();
+                    snapshot = TxTask.GetActiveWaits();
+                    cts.Cancel();
+                    try { await Task.WhenAll(a, b, c, d); } catch (OperationCanceledException) { }
+                    await TxTask.NextFrame();
+                });
+                Completed(t, "追踪");
+                T.Eq("Sleep,Frames,Until,Signal", string.Join(",", snapshot!.Select(w => w.Kind)), "四种等待");
+                T.True(snapshot!.All(w => w.StackTrace != null && w.StackTrace.Contains("TaskTests")), "记录了调用栈");
+                T.True(snapshot![0].Detail.Contains("秒"), $"说明文字: {snapshot[0].Detail}");
+                T.Eq(0, TxTask.ActiveWaitCount, "取消后全部清理");
+            }
+            finally
+            {
+                TxTask.TrackStackTraces = false;
+            }
+        });
+
         T.Add("TxTask.Sleep: 按游戏时间完成；非正数/NaN 立即完成", () =>
         {
             Start();

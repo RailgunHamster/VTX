@@ -58,8 +58,8 @@ namespace Godot.SourceGenerators
 
         public static readonly DiagnosticDescriptor RuleRawToSignalInSuspends = new DiagnosticDescriptor(
             id: "VTX005",
-            title: "[Suspends] 结构化并发内禁止使用不可取消的 ToSignal",
-            messageFormat: "[Suspends] 方法内禁止调用不可取消的 'ToSignal'（会导致 Race/作用域取消时协程泄漏），请改用 'TxTask.WaitSignal(obj, signal, ct)'。",
+            title: "[Suspends] 结构化并发内的等待必须可取消、按游戏时间推进",
+            messageFormat: "{0}",
             category: "VTX",
             defaultSeverity: DiagnosticSeverity.Error,
             isEnabledByDefault: true);
@@ -104,6 +104,14 @@ namespace Godot.SourceGenerators
             defaultSeverity: DiagnosticSeverity.Error,
             isEnabledByDefault: true);
 
+        public static readonly DiagnosticDescriptor RuleDiscardedSuspends = new DiagnosticDescriptor(
+            id: "VTX012",
+            title: "[Suspends] 任务被丢弃，异常会悄悄丢失",
+            messageFormat: "{0}",
+            category: "VTX",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
         public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics =>
             ImmutableArray.Create(
                 RuleNonTxMutation,
@@ -115,7 +123,8 @@ namespace Godot.SourceGenerators
                 RuleNonDeterministicCall,
                 RuleInvalidResPath,
                 RulePersistableSchemaBreak,
-                RulePureViolation);
+                RulePureViolation,
+                RuleDiscardedSuspends);
 
         public override void Initialize(AnalysisContext context)
         {
@@ -153,6 +162,11 @@ namespace Godot.SourceGenerators
             context.RegisterSyntaxNodeAction(AnalyzeObjectCreation, SyntaxKind.ObjectCreationExpression, SyntaxKind.ImplicitObjectCreationExpression);
             context.RegisterSyntaxNodeAction(AnalyzeMemberAccess, SyntaxKind.SimpleMemberAccessExpression);
             context.RegisterSyntaxNodeAction(AnalyzeAwait, SyntaxKind.AwaitExpression);
+            context.RegisterSyntaxNodeAction(AnalyzeAsyncVoid,
+                SyntaxKind.MethodDeclaration,
+                SyntaxKind.LocalFunctionStatement,
+                SyntaxKind.ParenthesizedLambdaExpression,
+                SyntaxKind.SimpleLambdaExpression);
             context.RegisterSyntaxNodeAction(AnalyzeAwaitStatement,
                 SyntaxKind.ForEachStatement,
                 SyntaxKind.ForEachVariableStatement,
@@ -877,14 +891,22 @@ namespace Godot.SourceGenerators
 
             var effects = GetEffects(methodSymbol);
 
-            // VTX005: [Suspends] 内的 ToSignal
-            if (methodSymbol.Name == "ToSignal" && InheritsFromName(methodSymbol.ContainingType, "Godot.GodotObject") &&
-                IsInsideSuspendsMethod(model, invocation, context.CancellationToken))
+            var scope = FindScope(model, invocation, context.CancellationToken);
+
+            if (scope == null || scope.Kind != ScopeKind.Tx)
             {
-                context.ReportDiagnostic(Diagnostic.Create(RuleRawToSignalInSuspends, invocation.GetLocation()));
+                // VTX005：[Suspends] 协程里的等待必须可取消、按游戏时间推进
+                if (IsInsideSuspendsMethod(model, invocation, context.CancellationToken))
+                    CheckSuspendsWait(context, invocation, methodSymbol);
+
+                // VTX012：[Suspends] 返回的任务被丢弃（事务内已由 VTX003 报告）
+                if ((effects & Effect.Suspends) != 0 && IsTaskLike(methodSymbol.ReturnType) && IsDiscarded(invocation))
+                {
+                    context.ReportDiagnostic(Diagnostic.Create(RuleDiscardedSuspends, invocation.GetLocation(),
+                        $"[Suspends] 方法 '{methodSymbol.ContainingType?.Name}.{methodSymbol.Name}' 返回的任务被丢弃了：它抛出的异常会悄悄丢失，也没有人能等它结束。请 await 它，或在末尾调用 .Forget()（异常会通过 GD.PushError 报告）"));
+                }
             }
 
-            var scope = FindScope(model, invocation, context.CancellationToken);
             if (scope == null)
                 return;
 
@@ -1286,6 +1308,128 @@ namespace Godot.SourceGenerators
                 }
             }
             return false;
+        }
+
+        // =====================================================================
+        // VTX005 / VTX012：协程（[Suspends]）规则
+        // =====================================================================
+
+        private static void CheckSuspendsWait(SyntaxNodeAnalysisContext context, InvocationExpressionSyntax invocation, IMethodSymbol method)
+        {
+            string typeName = method.ContainingType?.ToDisplayString() ?? string.Empty;
+
+            if (method.Name == "ToSignal" && InheritsFromName(method.ContainingType, "Godot.GodotObject"))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(RuleRawToSignalInSuspends, invocation.GetLocation(),
+                    "[Suspends] 方法内禁止调用不可取消的 'ToSignal'（Race 落败或作用域结束时协程会一直挂着），请改用 'TxTask.WaitSignal(obj, signal, ct)'"));
+                return;
+            }
+
+            if (typeName == "System.Threading.Tasks.Task" && method.Name == "Delay")
+            {
+                context.ReportDiagnostic(Diagnostic.Create(RuleRawToSignalInSuspends, invocation.GetLocation(),
+                    "[Suspends] 方法内禁止使用 'Task.Delay'（按真实时间计时、不受暂停与慢放影响，计时器跑在线程池上），请改用 'TxTask.Sleep(秒, ct)' 或 'TxTask.DelayFrames(帧数, ct)'"));
+                return;
+            }
+
+            if (typeName != "VTX.TxTask" && (GetEffects(method) & Effect.Suspends) == 0)
+                return;
+
+            // 协程手里有取消令牌时，调用 TxTask 的等待 / 组合 API 以及其它 [Suspends] 方法都必须把它传下去
+            var available = FindAvailableCancellationToken(context.SemanticModel, invocation, context.CancellationToken);
+            if (available == null)
+                return;
+
+            bool passesToken = false;
+            foreach (var arg in invocation.ArgumentList.Arguments)
+            {
+                var t = context.SemanticModel.GetTypeInfo(arg.Expression, context.CancellationToken).Type;
+                if (t != null && t.ToDisplayString() == "System.Threading.CancellationToken")
+                {
+                    passesToken = true;
+                    break;
+                }
+            }
+            if (passesToken)
+                return;
+
+            bool acceptsToken = method.Parameters.Any(IsCancellationTokenParameter) ||
+                                method.ContainingType!.GetMembers(method.Name).OfType<IMethodSymbol>().Any(m => m.Parameters.Any(IsCancellationTokenParameter));
+            if (!acceptsToken)
+                return;
+
+            context.ReportDiagnostic(Diagnostic.Create(RuleRawToSignalInSuspends, invocation.GetLocation(),
+                $"调用 '{method.ContainingType?.Name}.{method.Name}' 时没有传入取消令牌 '{available.Name}'：外层被取消（Race 落败、作用域结束、节点释放）时这次等待不会停止。请把 '{available.Name}' 传进去；确实不需要取消时显式传 CancellationToken.None"));
+        }
+
+        private static bool IsCancellationTokenParameter(IParameterSymbol p) =>
+            p.Type.ToDisplayString() == "System.Threading.CancellationToken";
+
+        /// <summary>从调用处向外找最近的、类型为 CancellationToken 的参数（lambda / 局部函数 / 方法）。</summary>
+        private static IParameterSymbol? FindAvailableCancellationToken(SemanticModel model, SyntaxNode node, System.Threading.CancellationToken ct)
+        {
+            for (SyntaxNode? cur = node.Parent; cur != null; cur = cur.Parent)
+            {
+                IMethodSymbol? fn = cur switch
+                {
+                    AnonymousFunctionExpressionSyntax anon => model.GetSymbolInfo(anon, ct).Symbol as IMethodSymbol,
+                    LocalFunctionStatementSyntax local => model.GetDeclaredSymbol(local, ct) as IMethodSymbol,
+                    MethodDeclarationSyntax method => model.GetDeclaredSymbol(method, ct) as IMethodSymbol,
+                    _ => null
+                };
+                if (fn == null)
+                    continue;
+                var token = fn.Parameters.FirstOrDefault(IsCancellationTokenParameter);
+                if (token != null)
+                    return token;
+                if (cur is MethodDeclarationSyntax)
+                    return null;
+            }
+            return null;
+        }
+
+        private static bool IsTaskLike(ITypeSymbol type)
+        {
+            string name = type.OriginalDefinition.ToDisplayString();
+            return name is "System.Threading.Tasks.Task" or "System.Threading.Tasks.Task<TResult>"
+                or "System.Threading.Tasks.ValueTask" or "System.Threading.Tasks.ValueTask<TResult>";
+        }
+
+        /// <summary>调用结果被直接丢弃：单独成句，或赋给弃元 _。</summary>
+        private static bool IsDiscarded(InvocationExpressionSyntax invocation)
+        {
+            SyntaxNode node = invocation;
+            while (node.Parent is ParenthesizedExpressionSyntax)
+                node = node.Parent;
+            if (node.Parent is ExpressionStatementSyntax)
+                return true;
+            return node.Parent is AssignmentExpressionSyntax assign && assign.Right == node &&
+                   assign.Left is IdentifierNameSyntax id && id.Identifier.ValueText == "_";
+        }
+
+        private static void AnalyzeAsyncVoid(SyntaxNodeAnalysisContext context)
+        {
+            var model = context.SemanticModel;
+            IMethodSymbol? symbol = context.Node switch
+            {
+                MethodDeclarationSyntax m => model.GetDeclaredSymbol(m, context.CancellationToken),
+                LocalFunctionStatementSyntax l => model.GetDeclaredSymbol(l, context.CancellationToken) as IMethodSymbol,
+                AnonymousFunctionExpressionSyntax a => model.GetSymbolInfo(a, context.CancellationToken).Symbol as IMethodSymbol,
+                _ => null
+            };
+            if (symbol == null || !symbol.IsAsync || !symbol.ReturnsVoid)
+                return;
+            if ((GetEffects(symbol) & Effect.Suspends) == 0)
+                return;
+
+            Location location = context.Node switch
+            {
+                MethodDeclarationSyntax m => m.Identifier.GetLocation(),
+                LocalFunctionStatementSyntax l => l.Identifier.GetLocation(),
+                _ => context.Node.GetLocation()
+            };
+            context.ReportDiagnostic(Diagnostic.Create(RuleDiscardedSuspends, location,
+                $"[Suspends] 方法 '{symbol.Name}' 不能是 async void：调用方无法等待或取消它，异常也会丢失。请返回 Task"));
         }
 
         // =====================================================================

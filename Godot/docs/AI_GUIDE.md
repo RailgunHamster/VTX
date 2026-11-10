@@ -1,7 +1,7 @@
 # VTX (`using VTX;`) 人类与 AI Agent 编码指南
 
 > **给 AI Agent 的核心提示（TL;DR）**：
-> 本引擎内置了 `VTX` 事务回滚与结构化并发系统，并由 Roslyn 编译器强制执行 **`VTX001` ~ `VTX011` 十一道红线**。完整可编译示例代码见同目录下的 [`Examples.cs`](Examples.cs)。
+> 本引擎内置了 `VTX` 事务回滚与结构化并发系统，并由 Roslyn 编译器强制执行 **`VTX001` ~ `VTX012` 十二道红线**。完整可编译示例代码见同目录下的 [`Examples.cs`](Examples.cs)。
 > 1. **禁止拆分 `CanExecute()` 与 `Execute()`**：凡涉及多步条件校验与状态修改（如扣费、合成、出牌、吃碰杠、技能结算），统一写成一个标有 `[Decides]` 的方法，在里面直接修改事务状态并用 `Tx.Check(cond, reason)` 校验。
 >    - 询问是否可执行（UI 按钮高亮 / AI 推演）：调用 `Tx.Simulate(() => MyAction(), out string? failReason)`（试跑后 100% 自动回滚，失败时拿到原因）。
 >    - 真正执行：调用 `Tx.Try(() => MyAction(), out string? failReason)`（全部成功则提交，任一步失败则自动回滚）。
@@ -23,6 +23,10 @@
 >    - 严禁在 `[Transacts]` / `[Decides]` 方法或 `Tx.Try` 块内使用 `await`（触发 `VTX003`）。
 >    - 跨帧协程统一标 `[Suspends]`，使用 `TxTask.Race`、`TxTask.Sync`、`TxTask.Rush`、`TxTask.WithScope`（配合 `scope.Branch`）、`TxTask.Defer`、`TxTask.Sleep(seconds, ct)`（暂停时不计时；暂停菜单里用 `TxTask.SleepIgnoringPause`）和支持强类型返回值解包的 `TxTask.WaitSignal<T0, T1>(obj, signal, ct)`。**严禁在 `[Suspends]` 内调用原生 `ToSignal`（触发 `VTX005`）**。
 >    - 所有 `TxTask` API 都在 Godot 主线程调用；父令牌被取消时 `Race` / `Rush` / `Sync` 抛出 `OperationCanceledException`，不会返回“胜者”。
+>    - 按帧等待用 `TxTask.NextFrame(ct)` / `DelayFrames(n, ct)` / `NextPhysicsFrame(ct)`，等条件用 `TxTask.WaitUntil(() => 条件, ct)`（条件必须只读）；**不要用 `Task.Delay`**（真实时间、不受暂停影响，触发 `VTX005`）。
+>    - 协程手里有 `ct` 就一路传下去（否则 `VTX005`）；协程属于某个节点时用 `TxTask.LifetimeOf(this)` 作为令牌，节点 `QueueFree` / 被释放时协程自动取消。
+>    - 不等待的 `[Suspends]` 调用必须写 `.Forget()`（异常会通过 `GD.PushError` 报告），`[Suspends]` 方法不能是 `async void`（`VTX012`）。
+>    - 排查协程泄漏：`TxTask.TrackStackTraces = true;` 然后看 `TxTask.GetActiveWaits()`。
 
 ---
 
@@ -73,10 +77,11 @@
 | **`VTX002`** | 事务内调用了未标记 `[Transacts]`/`[Decides]`/`[Pure]` 的方法、`[NoRollback]` 方法、无法静态验证的委托，或创建了非 `RefCounted` 的 Godot 对象（如 `new Node()`，回滚后泄漏）；也包括把委托变量 / 未标注的方法组传给 `[Transacts]` 参数 | 1. 若被调方法确实是纯计算，给它加上 `[Pure]`（方法体会被 `VTX010` 校验，不能用来“消除报错”）；<br>2. 若被调方法只修改事务状态，给它加上 `[Transacts]` 或 `[Decides]`；<br>3. 若是日志/信号/节点释放等外部副作用，改用 `TxGodot.Log`/`EmitSignal`/`QueueFree` 或包在 `Tx.Defer(() => ...)` 中；<br>4. 委托：在参数位置直接写 lambda，或把高阶函数的委托参数标为 `[Transacts]`；<br>5. Godot 节点：在事务外创建，或在 `Tx.Defer` 里创建。 |
 | **`VTX003`** | 在事务方法或 `Tx.Try` 块内使用了 `await`（含 `await foreach` / `await using`）、调用了 `[Suspends]` 方法，或把事务方法写成了 `async` / 迭代器（`yield`） | 事务必须在单帧同步内完成。请将跨帧 `await` 移出事务块：先在事务内完成状态试探或结算，事务结束后再 `await TxTask.Sleep(...)`。 |
 | **`VTX004`** | 在手写代码中直接给 `[TxField]` 的底层私有字段（如 `_gold`）赋值（构造函数内初始化除外） | 改为写入生成器自动生成的公开属性（如 `Gold = ...`），以确保修改经过 Undo Log。 |
-| **`VTX005`** | 在 `[Suspends]` 方法内调用了不可取消的 Godot 原生 `ToSignal` | 替换为 `await TxTask.WaitSignal(obj, signalName, ct)`，确保在 `TxTask.Race` 取消时能自动退订信号。 |
+| **`VTX005`** | 在 `[Suspends]` 方法内调用了不可取消的 `ToSignal`、使用了 `Task.Delay`，或手里有取消令牌却没有传给 `TxTask` 的等待 / 组合 API 或其它 `[Suspends]` 方法 | `ToSignal` → `TxTask.WaitSignal(obj, signal, ct)`；`Task.Delay` → `TxTask.Sleep(秒, ct)` / `DelayFrames(帧, ct)`；把 `ct` 传下去，确实不需要取消时显式传 `CancellationToken.None`。 |
 | **`VTX006`** | 在 `[TxField]` 上声明了 `T[]`、`List<T>`、`Dictionary<K,V>`、Godot 集合等非事务可变容器（实现 `ICollection` 的类型；不可变集合与 Tx 容器除外） | 移除 `[TxField]`，改为只读属性持有事务容器：<br>`public TxList<T> Items { [Pure] get; } = new();` |
 | **`VTX007`** | 在事务或 `[Pure]` 内调用了 `System.Random`、`GD.Randf`/`Randi`、`RandomNumberGenerator`、`Time.*`、`Stopwatch`、`DateTime.Now`/`Today`、`Guid.NewGuid` | 改用状态可随事务自动回滚的 `TxRandom`（如 `Rng.NextInt(...)` / `Rng.CheckChance(...)`），或在事务外生成后作为参数传入。 |
 | **`VTX008`** | 代码中的 `"res://..."` 字符串路径在项目磁盘中不存在，或**大小写与磁盘不一致**（Windows 上能跑、导出后找不到） | 改用编译期自动生成的 `VTX.Res` 强类型常量（如 `Res.Scenes.Player`），或检查文件路径拼写与大小写。拼接出来的路径片段（`"res://levels/level_" + n`）与含 `{}` 的格式串不检查。 |
 | **`VTX009`** | `[TxPersistable]` 类删除了已持久化的基线字段或更改了字段类型 | 恢复被删改的 `[TxField]` 字段与原类型以保持旧存档兼容，新需求请通过新增字段平滑扩展。 |
 | **`VTX010`** | `[Pure]` 方法 / 属性 / lambda 有副作用：修改了非局部状态、调用了非 `[Pure]` 方法或 `[Transacts]` 方法 | 去掉副作用；若需要“试跑”事务逻辑，用 `Tx.Simulate(() => ...)`；若方法本来就会修改状态，把 `[Pure]` 换成 `[Transacts]`。 |
+| **`VTX012`** | `[Suspends]` 方法返回的任务被丢弃（单独一句调用或 `_ = ...`），或 `[Suspends]` 方法写成了 `async void` | `await` 它；确实要“发出去不管”就写 `.Forget()`；`async void` 改成返回 `Task`。 |
 | **`VTX011`** | `[TxField]` / `[TxInvariant]` 用在了不支持的地方：struct、static / readonly 字段、非 partial 类型（含外层类型）、生成的属性名冲突或不合法、`[TxInvariant]` 方法带参数或有返回值 | 改为 `partial class`；字段改成实例、非 readonly；用 `[TxField("Name")]` 指定不冲突的属性名；`[TxInvariant]` 写成无参数 `void` 方法。 |

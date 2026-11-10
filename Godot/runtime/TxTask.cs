@@ -70,16 +70,43 @@ public sealed class TxScope
     }
 }
 
+/// <summary>挂起中的等待属于哪一类（用于 <see cref="TxTask.GetActiveWaits"/> 调试）。</summary>
+public enum TxWaitKind
+{
+    /// <summary>TxTask.Sleep / SleepIgnoringPause：按游戏时间等待。</summary>
+    Sleep,
+    /// <summary>TxTask.NextFrame / DelayFrames：按处理帧等待。</summary>
+    Frames,
+    /// <summary>TxTask.NextPhysicsFrame / DelayPhysicsFrames：按物理帧等待。</summary>
+    PhysicsFrames,
+    /// <summary>TxTask.WaitUntil：每帧检查一次条件。</summary>
+    Until,
+    /// <summary>TxTask.WaitSignal：等待 Godot 信号。</summary>
+    Signal,
+}
+
+/// <summary>一条挂起中的等待的快照（<see cref="TxTask.GetActiveWaits"/> 返回）。</summary>
+/// <param name="Kind">等待的类型。</param>
+/// <param name="Detail">人类可读的说明，例如“还剩 0.42 秒”。</param>
+/// <param name="StartedAtGameTime">开始等待时的游戏时间（秒）。</param>
+/// <param name="StackTrace">开始等待时的调用栈；只有 <see cref="TxTask.TrackStackTraces"/> 为 true 时才记录。</param>
+public readonly record struct TxWaitInfo(TxWaitKind Kind, string Detail, double StartedAtGameTime, string? StackTrace);
+
 /// <summary>
 /// VTX 帧驱动结构化并发运行时：
-/// 1. 基于游戏逻辑时间推进（Sleep）与可取消信号等待（WaitSignal）；
+/// 1. 基于游戏逻辑时间 / 帧推进的等待（Sleep、NextFrame、DelayFrames、NextPhysicsFrame、WaitUntil）与可取消信号等待（WaitSignal）；
 /// 2. Race（赢家胜出，输家立即取消）、Sync（等待全部）、Rush（首个完成即继续，其余后台继续跑）；
 /// 3. WithScope + Branch（结构化分叉子任务，出作用域自动回收）；
-/// 4. Defer（协程作用域退出或被取消时自动按 LIFO 逆序执行清理）。
+/// 4. Defer（协程作用域退出或被取消时自动按 LIFO 逆序执行清理）；
+/// 5. LifetimeOf(node)（节点被释放 / QueueFree 时自动取消的令牌）与 Forget()（发出去不管的任务也不会吞掉异常）；
+/// 6. GetActiveWaits()（列出所有挂起中的等待，排查协程泄漏）。
 ///
 /// 线程模型：所有 API 都应在 Godot 主线程调用；内部不使用 ConfigureAwait(false)，
 /// 续体通过 Godot 的 SynchronizationContext 回到主线程。从其它线程取消令牌（例如 CancelAfter）也是安全的：
 /// 涉及 Godot 对象的清理会被投递回主线程执行。
+///
+/// 暂停：SceneTree.Paused 为 true 时游戏时间、处理帧计数、物理帧计数都不前进，WaitUntil 也不检查条件；
+/// 只有 SleepIgnoringPause 照常计时。生命周期检测（LifetimeOf / 信号源释放）不受暂停影响。
 /// </summary>
 public static class TxTask
 {
@@ -99,26 +126,129 @@ public static class TxTask
         }
     }
 
-    private sealed class TimerEntry
+    // ---------------------------------------------------------------------
+    // 统一的等待登记表：每一个挂起中的等待都是一个 WaitEntry，由主线程上的帧回调推进。
+    // 取消回调可能在任意线程触发，因此它们只负责完成 Task；条目本身只在主线程上被移除。
+    // ---------------------------------------------------------------------
+
+    private abstract class WaitEntry
+    {
+        public TxWaitKind Kind;
+        public double StartedAt;
+        public string? Stack;
+        public abstract bool IsDone { get; }
+        public abstract string Describe();
+        public virtual void OnProcess(double delta, bool paused) { }
+        public virtual void OnPhysics(bool paused) { }
+    }
+
+    private sealed class TimerWait : WaitEntry
     {
         public double RemainingSeconds;
         public bool IgnorePause;
-        public TaskCompletionSource<bool> Tcs = null!;
+        public readonly TaskCompletionSource<bool> Tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public CancellationTokenRegistration Registration;
+        public override bool IsDone => Tcs.Task.IsCompleted;
+        public override string Describe() => $"还剩 {Math.Max(0, RemainingSeconds):0.###} 秒{(IgnorePause ? "（忽略暂停）" : string.Empty)}";
+
+        public override void OnProcess(double delta, bool paused)
+        {
+            if (paused && !IgnorePause)
+                return;
+            RemainingSeconds -= delta;
+            if (RemainingSeconds <= 0)
+            {
+                Registration.Dispose();
+                Tcs.TrySetResult(true);
+            }
+        }
     }
 
-    private sealed class PendingWait
+    private sealed class FrameWait : WaitEntry
+    {
+        public long TargetFrame;
+        public bool Physics;
+        public readonly TaskCompletionSource<bool> Tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public CancellationTokenRegistration Registration;
+        public override bool IsDone => Tcs.Task.IsCompleted;
+        public override string Describe() =>
+            $"还要等 {Math.Max(0, TargetFrame - (Physics ? _physicsFrames : _gameFrames))} 个{(Physics ? "物理帧" : "帧")}";
+
+        public override void OnProcess(double delta, bool paused)
+        {
+            if (!Physics && _gameFrames >= TargetFrame)
+                Complete();
+        }
+
+        public override void OnPhysics(bool paused)
+        {
+            if (Physics && _physicsFrames >= TargetFrame)
+                Complete();
+        }
+
+        private void Complete()
+        {
+            Registration.Dispose();
+            Tcs.TrySetResult(true);
+        }
+    }
+
+    private sealed class UntilWait : WaitEntry
+    {
+        public Func<bool> Condition = null!;
+        public readonly TaskCompletionSource<bool> Tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public CancellationTokenRegistration Registration;
+        public int Checks;
+        public override bool IsDone => Tcs.Task.IsCompleted;
+        public override string Describe() => $"条件已检查 {Checks} 次，仍未满足";
+
+        public override void OnProcess(double delta, bool paused)
+        {
+            if (paused)
+                return;
+            Checks++;
+            try
+            {
+                if (Condition())
+                {
+                    Registration.Dispose();
+                    Tcs.TrySetResult(true);
+                }
+            }
+            catch (Exception ex)
+            {
+                Registration.Dispose();
+                Tcs.TrySetException(ex);
+            }
+        }
+    }
+
+    private sealed class SignalWait : WaitEntry
     {
         public GodotObject Source = null!;
+        public string SignalName = string.Empty;
+        public Func<bool> Done = null!;
         public Action<Exception> FailFreed = null!;
-        public Func<bool> IsDone = null!;
+        public override bool IsDone => Done();
+        public override string Describe() => $"等待信号 '{SignalName}'";
+
+        public override void OnProcess(double delta, bool paused)
+        {
+            if (!GodotObject.IsInstanceValid(Source))
+            {
+                FailFreed(new ObjectDisposedException(nameof(GodotObject), $"VTX: WaitSignal('{SignalName}') 的信号源对象在信号发出前已被释放。"));
+            }
+        }
     }
 
-    private static readonly List<TimerEntry> _timers = new();
-    private static readonly List<PendingWait> _pendingWaits = new();
+    private static readonly List<WaitEntry> _waits = new();
+    private static readonly Dictionary<Node, CancellationTokenSource> _lifetimes = new(ReferenceEqualityComparer.Instance);
     private static double _gameTimeSeconds;
+    private static long _gameFrames;
+    private static long _physicsFrames;
     private static bool _autoHooked;
     private static ulong _lastTickFrame = ulong.MaxValue;
+    private static ulong _lastPhysicsFrame = ulong.MaxValue;
 
     /// <summary>当前累计的逻辑游戏时间（秒，SceneTree 暂停期间不前进）。</summary>
     public static double GameTimeSeconds
@@ -126,36 +256,76 @@ public static class TxTask
         [Pure] get => _gameTimeSeconds;
     }
 
-    /// <summary>当前挂起中的帧定时器数量（用于验证 Race/Scope 取消后零泄漏）。</summary>
+    /// <summary>累计的未暂停处理帧数（NextFrame / DelayFrames 以它计数）。</summary>
+    public static long GameFrames
+    {
+        [Pure] get => _gameFrames;
+    }
+
+    /// <summary>累计的未暂停物理帧数（NextPhysicsFrame / DelayPhysicsFrames 以它计数）。</summary>
+    public static long PhysicsFrames
+    {
+        [Pure] get => _physicsFrames;
+    }
+
+    /// <summary>
+    /// 为 true 时，每次开始等待都会记录调用栈，<see cref="GetActiveWaits"/> 能告诉你“是谁在等”。
+    /// 有性能开销，只建议在排查协程泄漏时打开。
+    /// </summary>
+    public static bool TrackStackTraces { get; set; }
+
+    /// <summary>当前挂起中的游戏时间定时器数量（用于验证 Race/Scope 取消后零泄漏）。</summary>
     public static int ActiveTimerCount
+    {
+        [Pure] get => CountActive(TxWaitKind.Sleep);
+    }
+
+    /// <summary>当前挂起中的信号等待数量（用于验证取消后零泄漏）。</summary>
+    public static int ActiveSignalWaitCount
+    {
+        [Pure] get => CountActive(TxWaitKind.Signal);
+    }
+
+    /// <summary>当前挂起中的所有等待（任意类型）的数量。</summary>
+    public static int ActiveWaitCount
     {
         [Pure]
         get
         {
             int n = 0;
-            foreach (var t in _timers)
+            foreach (var w in _waits)
             {
-                if (!t.Tcs.Task.IsCompleted)
+                if (!w.IsDone)
                     n++;
             }
             return n;
         }
     }
 
-    /// <summary>当前挂起中的信号等待数量（用于验证取消后零泄漏）。</summary>
-    public static int ActiveSignalWaitCount
+    private static int CountActive(TxWaitKind kind)
     {
-        [Pure]
-        get
+        int n = 0;
+        foreach (var w in _waits)
         {
-            int n = 0;
-            foreach (var w in _pendingWaits)
-            {
-                if (!w.IsDone())
-                    n++;
-            }
-            return n;
+            if (w.Kind == kind && !w.IsDone)
+                n++;
         }
+        return n;
+    }
+
+    /// <summary>
+    /// 列出所有挂起中的等待（快照）。配合 <see cref="TrackStackTraces"/> 可以定位泄漏的协程是从哪里开始等的。
+    /// </summary>
+    [Pure]
+    public static IReadOnlyList<TxWaitInfo> GetActiveWaits()
+    {
+        var result = new List<TxWaitInfo>();
+        foreach (var w in _waits)
+        {
+            if (!w.IsDone)
+                result.Add(new TxWaitInfo(w.Kind, w.Describe(), w.StartedAt, w.Stack));
+        }
+        return result;
     }
 
     /// <summary>
@@ -169,10 +339,13 @@ public static class TxTask
     }
 
     /// <summary>
-    /// 手动推进所有按游戏时间挂起的任务（视为未暂停）。
+    /// 手动推进一帧（视为未暂停）：游戏时间 + delta、处理帧数 + 1。
     /// 若已在 SceneTree 环境运行，系统会自动通过 ProcessFrame 驱动；同一帧内的重复调用会被去重。
     /// </summary>
     public static void Tick(double delta) => TickInternal(delta, paused: false);
+
+    /// <summary>手动推进一个物理帧（视为未暂停）。同一物理帧内的重复调用会被去重。</summary>
+    public static void TickPhysics() => TickPhysicsInternal(paused: false);
 
     private static void TickInternal(double delta, bool paused)
     {
@@ -181,53 +354,52 @@ public static class TxTask
             return;
         _lastTickFrame = frame;
 
-        PollPendingWaits();
-
         if (!(delta > 0))
-            return;
+            delta = 0;
 
         if (!paused)
         {
             _gameTimeSeconds += delta;
+            _gameFrames++;
         }
 
-        for (int i = _timers.Count - 1; i >= 0; i--)
+        for (int i = _waits.Count - 1; i >= 0; i--)
         {
-            var entry = _timers[i];
-            if (entry.Tcs.Task.IsCompleted)
+            // 列表可能在回调中被修改（例如完成时同步登记了新的等待），先做边界检查
+            if (i >= _waits.Count)
+                continue;
+            var w = _waits[i];
+            if (w.IsDone)
             {
-                _timers.RemoveAt(i);
+                _waits.RemoveAt(i);
                 continue;
             }
-
-            if (paused && !entry.IgnorePause)
-                continue;
-
-            entry.RemainingSeconds -= delta;
-            if (entry.RemainingSeconds <= 0)
-            {
-                _timers.RemoveAt(i);
-                entry.Registration.Dispose();
-                entry.Tcs.TrySetResult(true);
-            }
+            w.OnProcess(delta, paused);
+            if (w.IsDone && i < _waits.Count && ReferenceEquals(_waits[i], w))
+                _waits.RemoveAt(i);
         }
+
+        PollLifetimes();
     }
 
-    private static void PollPendingWaits()
+    private static void TickPhysicsInternal(bool paused)
     {
-        for (int i = _pendingWaits.Count - 1; i >= 0; i--)
+        ulong frame = Engine.GetPhysicsFrames();
+        if (frame != 0 && frame == _lastPhysicsFrame)
+            return;
+        _lastPhysicsFrame = frame;
+
+        if (paused)
+            return;
+        _physicsFrames++;
+
+        for (int i = _waits.Count - 1; i >= 0; i--)
         {
-            var w = _pendingWaits[i];
-            if (w.IsDone())
-            {
-                _pendingWaits.RemoveAt(i);
+            if (i >= _waits.Count)
                 continue;
-            }
-            if (!GodotObject.IsInstanceValid(w.Source))
-            {
-                _pendingWaits.RemoveAt(i);
-                w.FailFreed(new ObjectDisposedException(nameof(GodotObject), "VTX: WaitSignal 的信号源对象在信号发出前已被释放。"));
-            }
+            var w = _waits[i];
+            if (!w.IsDone)
+                w.OnPhysics(paused);
         }
     }
 
@@ -250,7 +422,21 @@ public static class TxTask
                     TickInternal(1.0 / 60.0, paused: false);
                 }
             };
+            tree.PhysicsFrame += () =>
+            {
+                bool paused = Engine.GetMainLoop() is SceneTree activeTree && activeTree.Paused;
+                TickPhysicsInternal(paused);
+            };
         }
+    }
+
+    private static void Register(WaitEntry entry)
+    {
+        entry.StartedAt = _gameTimeSeconds;
+        if (TrackStackTraces)
+            entry.Stack = new System.Diagnostics.StackTrace(2, true).ToString();
+        _waits.Add(entry);
+        EnsureAutoHook();
     }
 
     /// <summary>
@@ -274,28 +460,152 @@ public static class TxTask
         if (!(seconds > 0))
             return Task.CompletedTask;
 
-        EnsureAutoHook();
-
-        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var entry = new TimerEntry
-        {
-            RemainingSeconds = seconds,
-            IgnorePause = ignorePause,
-            Tcs = tcs
-        };
-
-        _timers.Add(entry);
+        var entry = new TimerWait { Kind = TxWaitKind.Sleep, RemainingSeconds = seconds, IgnorePause = ignorePause };
+        Register(entry);
         if (ct.CanBeCanceled)
+            entry.Registration = ct.Register(static s => ((TimerWait)s!).Tcs.TrySetCanceled(), entry);
+        return entry.Tcs.Task;
+    }
+
+    /// <summary>等到下一帧（下一次未暂停的 ProcessFrame）。注意：Sleep(0) 会立即完成，不会等一帧。</summary>
+    [Suspends]
+    public static Task NextFrame(CancellationToken ct = default) => DelayFramesCore(1, physics: false, ct);
+
+    /// <summary>等待指定数量的处理帧（暂停期间不计数）。frames 不是正数时立即完成。</summary>
+    [Suspends]
+    public static Task DelayFrames(int frames, CancellationToken ct = default) => DelayFramesCore(frames, physics: false, ct);
+
+    /// <summary>等到下一个物理帧（下一次未暂停的 PhysicsFrame），适合在物理步进之后读取碰撞结果。</summary>
+    [Suspends]
+    public static Task NextPhysicsFrame(CancellationToken ct = default) => DelayFramesCore(1, physics: true, ct);
+
+    /// <summary>等待指定数量的物理帧（暂停期间不计数）。frames 不是正数时立即完成。</summary>
+    [Suspends]
+    public static Task DelayPhysicsFrames(int frames, CancellationToken ct = default) => DelayFramesCore(frames, physics: true, ct);
+
+    private static Task DelayFramesCore(int frames, bool physics, CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested)
+            return Task.FromCanceled(ct);
+        if (frames <= 0)
+            return Task.CompletedTask;
+
+        var entry = new FrameWait
         {
-            // 回调可能在任意线程上执行（例如 CancelAfter），这里只完成任务；
-            // 定时器条目由主线程上的 Tick 清理，避免跨线程修改 _timers。
-            entry.Registration = ct.Register(static state =>
-            {
-                var (e, token) = ((TimerEntry, CancellationToken))state!;
-                e.Tcs.TrySetCanceled(token);
-            }, (entry, ct));
+            Kind = physics ? TxWaitKind.PhysicsFrames : TxWaitKind.Frames,
+            Physics = physics,
+            // 以“当前计数 + n”为目标：即使在本帧的回调里登记，也至少要等到下一次计数。
+            TargetFrame = (physics ? _physicsFrames : _gameFrames) + frames,
+        };
+        Register(entry);
+        if (ct.CanBeCanceled)
+            entry.Registration = ct.Register(static s => ((FrameWait)s!).Tcs.TrySetCanceled(), entry);
+        return entry.Tcs.Task;
+    }
+
+    /// <summary>
+    /// 每帧检查一次 condition，直到它返回 true（立即满足时同步完成）。暂停期间不检查。
+    /// condition 应当只读、没有副作用；它抛出的异常会让等待以该异常失败。
+    /// </summary>
+    [Suspends]
+    public static Task WaitUntil(Func<bool> condition, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(condition);
+        if (ct.IsCancellationRequested)
+            return Task.FromCanceled(ct);
+        try
+        {
+            if (condition())
+                return Task.CompletedTask;
         }
-        return tcs.Task;
+        catch (Exception ex)
+        {
+            return Task.FromException(ex);
+        }
+
+        var entry = new UntilWait { Kind = TxWaitKind.Until, Condition = condition };
+        Register(entry);
+        if (ct.CanBeCanceled)
+            entry.Registration = ct.Register(static s => ((UntilWait)s!).Tcs.TrySetCanceled(), entry);
+        return entry.Tcs.Task;
+    }
+
+    /// <summary>
+    /// 返回一个跟随节点生命周期的取消令牌：节点被 QueueFree（进入待删除状态）或被释放时自动取消。
+    /// 同一个节点多次调用返回同一个令牌。只是移出场景树（例如重新挂到别的父节点下）不会取消。
+    /// 典型用法：<c>await TxTask.Sleep(3, TxTask.LifetimeOf(this));</c> 或作为 Race / WithScope 的父令牌。
+    /// 检测在主线程上进行：QueueFree 的节点在离开场景树时立即取消，直接 Free 的节点最迟在下一帧取消。
+    /// </summary>
+    public static CancellationToken LifetimeOf(Node node)
+    {
+        ArgumentNullException.ThrowIfNull(node);
+        if (!GodotObject.IsInstanceValid(node) || node.IsQueuedForDeletion())
+            return new CancellationToken(canceled: true);
+
+        if (_lifetimes.TryGetValue(node, out var existing))
+            return existing.Token;
+
+        var cts = new CancellationTokenSource();
+        _lifetimes[node] = cts;
+        node.TreeExiting += () =>
+        {
+            if (!GodotObject.IsInstanceValid(node) || node.IsQueuedForDeletion())
+                EndLifetime(node);
+        };
+        EnsureAutoHook();
+        return cts.Token;
+    }
+
+    private static void EndLifetime(Node node)
+    {
+        if (_lifetimes.Remove(node, out var cts))
+        {
+            cts.Cancel();
+            cts.Dispose();
+        }
+    }
+
+    private static List<Node>? _endedScratch;
+
+    private static void PollLifetimes()
+    {
+        if (_lifetimes.Count == 0)
+            return;
+        var ended = _endedScratch ??= new List<Node>();
+        ended.Clear();
+        foreach (var node in _lifetimes.Keys)
+        {
+            if (!GodotObject.IsInstanceValid(node) || node.IsQueuedForDeletion())
+                ended.Add(node);
+        }
+        foreach (var node in ended)
+            EndLifetime(node);
+        ended.Clear();
+    }
+
+    /// <summary>
+    /// “发出去不管”的任务：不等待它，但它抛出的异常（取消除外）会通过 GD.PushError 报告，而不是悄悄丢失。
+    /// 用法：<c>PlayHitEffect(ct).Forget();</c>
+    /// </summary>
+    public static void Forget(this Task task)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+        ObserveForgotten(task, "未等待的任务");
+    }
+
+    private static async void ObserveForgotten(Task task, string what)
+    {
+        try
+        {
+            await task;
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            GD.PushError($"VTX: {what}抛出了未处理的异常: {ex}");
+        }
     }
 
     private static Task<TResult> WaitSignalCore<TResult>(
@@ -312,8 +622,6 @@ public static class TxTask
 
         if (!GodotObject.IsInstanceValid(source))
             return Task.FromException<TResult>(new ObjectDisposedException(nameof(GodotObject), "VTX: WaitSignal 的信号源对象已被释放。"));
-
-        EnsureAutoHook();
 
         var tcs = new TaskCompletionSource<TResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         var mainContext = SynchronizationContext.Current;
@@ -336,10 +644,12 @@ public static class TxTask
         callable = makeCallable(tcs, DisconnectSafe);
         source.Connect(signalName, callable);
 
-        _pendingWaits.Add(new PendingWait
+        Register(new SignalWait
         {
+            Kind = TxWaitKind.Signal,
             Source = source,
-            IsDone = () => tcs.Task.IsCompleted,
+            SignalName = signalName.ToString(),
+            Done = () => tcs.Task.IsCompleted,
             FailFreed = ex =>
             {
                 disconnected = true;
@@ -573,7 +883,7 @@ public static class TxTask
         for (int i = 0; i < tasks.Length; i++)
         {
             if (i != winnerIndex)
-                ObserveBackgroundBranch(tasks[i]);
+                ObserveForgotten(tasks[i], "Rush 后台分支");
         }
 
         bool completedNaturally = await winner;
@@ -582,21 +892,6 @@ public static class TxTask
             throw new OperationCanceledException(parentCt);
         }
         return winnerIndex;
-    }
-
-    private static async void ObserveBackgroundBranch(Task branch)
-    {
-        try
-        {
-            await branch;
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (Exception ex)
-        {
-            GD.PushError($"VTX: Rush 后台分支抛出了未处理的异常: {ex}");
-        }
     }
 
     /// <summary>

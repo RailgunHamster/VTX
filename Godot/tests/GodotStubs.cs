@@ -131,7 +131,12 @@ namespace Godot
         private Node? _parent;
         public readonly List<Node> Children = new();
         public bool QueuedForDeletion;
+        public event Action? TreeExiting;
+        public bool IsQueuedForDeletion() => QueuedForDeletion;
         public Node? GetParent() => _parent;
+        // 测试辅助：模拟“离开场景树”（例如被重新挂载）与“QueueFree 后在帧末被删除”
+        public void TestExitTree() => TreeExiting?.Invoke();
+        public void TestDeleteQueued() { TreeExiting?.Invoke(); Free(); }
         public void AddChild(Node node, bool forceReadableName = false) { AssertMainThread("AddChild"); Children.Add(node); node._parent = this; }
         public void RemoveChild(Node node) { AssertMainThread("RemoveChild"); Children.Remove(node); node._parent = null; }
         public void QueueFree() { AssertMainThread("QueueFree"); QueuedForDeletion = true; }
@@ -158,15 +163,18 @@ namespace Godot
     public class SceneTree : MainLoop
     {
         public event Action? ProcessFrame;
+        public event Action? PhysicsFrame;
         public Window Root { get; } = new();
         public bool Paused { get; set; }
-        // 测试辅助：推进一帧
-        public void TestStep() { Engine.Frames++; ProcessFrame?.Invoke(); }
+        // 测试辅助：推进一帧（先物理帧，再处理帧，与 Godot 的默认 60Hz 一致时每帧各一次）
+        public void TestStep() { Engine.PhysicsFrameCount++; PhysicsFrame?.Invoke(); Engine.Frames++; ProcessFrame?.Invoke(); }
     }
 
     public static class Engine
     {
         public static ulong Frames = 1;
+        public static ulong PhysicsFrameCount = 1;
+        public static ulong GetPhysicsFrames() => PhysicsFrameCount;
         public static double ProcessDelta = 1.0 / 60.0;
         public static SceneTree? Tree = new();
         public static ulong GetProcessFrames() => Frames;
