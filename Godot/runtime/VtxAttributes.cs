@@ -38,7 +38,7 @@ public sealed class TxInvariantAttribute : Attribute { }
 
 /// <summary>
 /// 标记 partial class 为跨会话持久化对象（对应 Verse 的 &lt;persistable&gt;）。
-/// 配合项目根目录的 vtx.schema.json 或类上的 [TxBaselineField] 契约，
+/// 配合项目根目录的 vtx.schema.txt（每行格式：ClassName|Prop1:Type1|Prop2:Type2）或类上的 [TxBaselineField] 契约，
 /// 编译器会静态检查该类的 [TxField] 属性是否破坏了旧存档向后兼容性（删除已持久化字段或篡改字段类型将触发 VTX009 编译错误）。
 /// </summary>
 [AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
@@ -68,14 +68,18 @@ public sealed class TxBaselineFieldAttribute : Attribute
 /// <summary>
 /// 标记方法或属性访问器在事务中可安全回滚。
 /// 编译器分析器会强制检查其内部所有修改与调用均具备可回滚性，且严禁跨帧挂起（await）。
+/// 标在属性上等价于标在它的所有访问器上；重写（override）或实现接口成员时自动继承该效果。
+/// 标在委托类型的参数上（如 <c>void ForEach([Transacts] Action&lt;T&gt; f)</c>）表示该委托会在事务内被调用：
+/// 分析器会把调用方传入的 lambda 当作事务上下文检查，并拒绝传入无法静态验证的委托变量。
 /// </summary>
-[AttributeUsage(AttributeTargets.Method | AttributeTargets.Property, Inherited = true)]
+[AttributeUsage(AttributeTargets.Method | AttributeTargets.Property | AttributeTargets.Parameter, Inherited = true)]
 public sealed class TransactsAttribute : Attribute { }
 
 /// <summary>
-/// 标记方法可能失败并触发事务自动回滚。
+/// 标记方法可能失败并触发事务自动回滚（隐含 [Transacts]）。
+/// 在事务之外调用并且失败时，会抛出 <see cref="TxFailedException"/>。
 /// </summary>
-[AttributeUsage(AttributeTargets.Method, Inherited = true)]
+[AttributeUsage(AttributeTargets.Method | AttributeTargets.Parameter, Inherited = true)]
 public sealed class DecidesAttribute : Attribute { }
 
 /// <summary>
@@ -87,8 +91,11 @@ public sealed class SuspendsAttribute : Attribute { }
 
 /// <summary>
 /// 标记方法或属性为无副作用纯函数，允许在事务内外安全调用。
+/// 分析器会校验 [Pure] 方法体：只能修改自己的局部变量，只能调用其它 [Pure] 方法或白名单内的纯计算 API，
+/// 只能通过 Tx.Simulate / Tx.WhereCan 这类“试跑后必定回滚”的入口触碰事务状态。
+/// 标在委托参数上表示该委托必须是纯函数（传入的 lambda 按 [Pure] 规则检查）。
 /// </summary>
-[AttributeUsage(AttributeTargets.Method | AttributeTargets.Property, Inherited = true)]
+[AttributeUsage(AttributeTargets.Method | AttributeTargets.Property | AttributeTargets.Parameter, Inherited = true)]
 public sealed class PureAttribute : Attribute { }
 
 /// <summary>

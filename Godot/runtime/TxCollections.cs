@@ -35,7 +35,11 @@ public sealed class TxArray<T> : IReadOnlyList<T>
         [Transacts]
         set
         {
-            Tx.Check((uint)index < (uint)_items.Length);
+            if ((uint)index >= (uint)_items.Length)
+            {
+                Tx.FailOrThrow($"TxArray 下标越界: {index} (Length={_items.Length})",
+                    new ArgumentOutOfRangeException(nameof(index), index, "Index was out of range."));
+            }
             T prev = _items[index];
             if (!EqualityComparer<T>.Default.Equals(prev, value))
             {
@@ -48,10 +52,11 @@ public sealed class TxArray<T> : IReadOnlyList<T>
         }
     }
 
+    /// <summary>可失败下标读取（越界时失败回滚；事务外越界抛 <see cref="TxFailedException"/>）。</summary>
     [Decides]
     public T At(int index)
     {
-        Tx.Check((uint)index < (uint)_items.Length);
+        Tx.Check((uint)index < (uint)_items.Length, "TxArray 下标越界");
         return _items[index];
     }
 
@@ -79,7 +84,11 @@ public sealed class TxList<T> : IReadOnlyList<T>
         [Transacts]
         set
         {
-            Tx.Check((uint)index < (uint)_items.Count);
+            if ((uint)index >= (uint)_items.Count)
+            {
+                Tx.FailOrThrow($"TxList 下标越界: {index} (Count={_items.Count})",
+                    new ArgumentOutOfRangeException(nameof(index), index, "Index was out of range."));
+            }
             T prev = _items[index];
             if (!EqualityComparer<T>.Default.Equals(prev, value))
             {
@@ -98,7 +107,7 @@ public sealed class TxList<T> : IReadOnlyList<T>
     [Decides]
     public T At(int index)
     {
-        Tx.Check((uint)index < (uint)_items.Count);
+        Tx.Check((uint)index < (uint)_items.Count, "TxList 下标越界");
         return _items[index];
     }
 
@@ -116,7 +125,11 @@ public sealed class TxList<T> : IReadOnlyList<T>
     [Transacts]
     public void Insert(int index, T item)
     {
-        Tx.Check((uint)index <= (uint)_items.Count);
+        if ((uint)index > (uint)_items.Count)
+        {
+            Tx.FailOrThrow($"TxList.Insert 下标越界: {index} (Count={_items.Count})",
+                new ArgumentOutOfRangeException(nameof(index), index, "Index must be within the bounds of the List."));
+        }
         _items.Insert(index, item);
         if (Tx.IsActive)
         {
@@ -127,7 +140,11 @@ public sealed class TxList<T> : IReadOnlyList<T>
     [Transacts]
     public void RemoveAt(int index)
     {
-        Tx.Check((uint)index < (uint)_items.Count);
+        if ((uint)index >= (uint)_items.Count)
+        {
+            Tx.FailOrThrow($"TxList.RemoveAt 下标越界: {index} (Count={_items.Count})",
+                new ArgumentOutOfRangeException(nameof(index), index, "Index was out of range."));
+        }
         T prev = _items[index];
         _items.RemoveAt(index);
         if (Tx.IsActive)
@@ -196,7 +213,11 @@ public sealed class TxDict<TKey, TValue> : IEnumerable<KeyValuePair<TKey, TValue
         [Decides]
         get
         {
-            Tx.Check(_dict.TryGetValue(key, out TValue? val));
+            if (!_dict.TryGetValue(key, out TValue? val))
+            {
+                Tx.FailOrThrow($"TxDict 中不存在键 '{key}'",
+                    new KeyNotFoundException($"The given key '{key}' was not present in the dictionary."));
+            }
             return val;
         }
 

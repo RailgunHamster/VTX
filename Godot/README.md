@@ -21,7 +21,7 @@ Godot/
 │   └── TxTask.cs               # 帧同步结构化并发：Race, Sync, Rush, WithScope+Branch, Defer, Sleep, WaitSignal<T>
 └── analyzers/                  # 链接编译进 Godot.SourceGenerators.dll
     ├── TxFieldGenerator.cs     # [TxField] 属性/快照/Diff/JSON 生成器 + VTX.Res 强类型资产清单生成器
-    └── VtxAnalyzer.cs          # Roslyn 静态分析器（强制拦截 VTX001 ~ VTX009）
+    └── VtxAnalyzer.cs          # Roslyn 静态分析器（强制拦截 VTX001 ~ VTX010；VTX011 由生成器报告）
 ```
 
 ---
@@ -45,6 +45,20 @@ Godot/
    ```
 
 ---
+
+## 测试
+
+`tests/` 是一个独立的控制台测试工程，不依赖 Godot 编辑器：
+- 运行时测试：用 `tests/GodotStubs.cs` 中的 Godot API 桩 + 模拟主线程的 SynchronizationContext，覆盖事务、容器、TxGodot、TxTask（含跨线程取消、暂停、信号源释放）；
+- 分析器 / 生成器测试：`tests/Cases/*.cs` 每行用 `// expect: VTX001` 标注期望诊断，未标注的行不允许出现诊断；带 `CaseRun` 的用例还会编译并执行生成后的代码；
+- `docs/Examples.cs` 会在测试中零诊断编译，并执行它自带的 `RunAllNewFeaturesSelfTest()`。
+
+```powershell
+cd "[root]/godot/engine/modules/vtx/Godot/tests"
+dotnet run                 # 全部测试
+dotnet run -- Analyzer     # 只跑名称包含 Analyzer 的测试
+$env:VTX_TEST_DUMP="D:\tmp\vtx-gen"; dotnet run -- 07_   # 把生成器输出写到目录里查看
+```
 
 ## 使用说明与 AI 编码规范
 
