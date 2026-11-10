@@ -342,10 +342,18 @@ public static class TxTask
     /// 手动推进一帧（视为未暂停）：游戏时间 + delta、处理帧数 + 1。
     /// 若已在 SceneTree 环境运行，系统会自动通过 ProcessFrame 驱动；同一帧内的重复调用会被去重。
     /// </summary>
-    public static void Tick(double delta) => TickInternal(delta, paused: false);
+    public static void Tick(double delta)
+    {
+        VtxThread.EnsureMainThread("TxTask.Tick");
+        TickInternal(delta, paused: false);
+    }
 
     /// <summary>手动推进一个物理帧（视为未暂停）。同一物理帧内的重复调用会被去重。</summary>
-    public static void TickPhysics() => TickPhysicsInternal(paused: false);
+    public static void TickPhysics()
+    {
+        VtxThread.EnsureMainThread("TxTask.TickPhysics");
+        TickPhysicsInternal(paused: false);
+    }
 
     private static void TickInternal(double delta, bool paused)
     {
@@ -432,6 +440,8 @@ public static class TxTask
 
     private static void Register(WaitEntry entry)
     {
+        // 登记表不是线程安全的：在后台线程（例如 ConfigureAwait(false) 之后）登记会破坏它，直接报错。
+        VtxThread.EnsureMainThread("TxTask 的等待（Sleep / NextFrame / DelayFrames / WaitUntil）");
         entry.StartedAt = _gameTimeSeconds;
         if (TrackStackTraces)
             entry.Stack = new System.Diagnostics.StackTrace(2, true).ToString();
@@ -539,6 +549,7 @@ public static class TxTask
     public static CancellationToken LifetimeOf(Node node)
     {
         ArgumentNullException.ThrowIfNull(node);
+        VtxThread.EnsureMainThread("TxTask.LifetimeOf");
         if (!GodotObject.IsInstanceValid(node) || node.IsQueuedForDeletion())
             return new CancellationToken(canceled: true);
 
@@ -616,6 +627,7 @@ public static class TxTask
     {
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(signalName);
+        VtxThread.EnsureMainThread("TxTask.WaitSignal");
 
         if (ct.IsCancellationRequested)
             return Task.FromCanceled<TResult>(ct);

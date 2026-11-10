@@ -470,5 +470,25 @@ internal static class TaskTests
             T.Eq(0, TxTask.ActiveTimerCount, "定时器已清理");
             NoOffThreadGodotCalls();
         });
+
+        T.Add("TxTask: 在后台线程登记等待会直接报错（而不是破坏登记表）", () =>
+        {
+            Start();
+            Exception? sleepEx = null, lifeEx = null;
+            var th = new Thread(() =>
+            {
+                try { _ = TxTask.Sleep(1); } catch (Exception e) { sleepEx = e; }
+                try { TxTask.LifetimeOf(new Node()); } catch (Exception e) { lifeEx = e; }
+            });
+            th.Start(); th.Join();
+            T.True(sleepEx is InvalidOperationException && sleepEx.Message.Contains("主线程"), "Sleep");
+            T.True(lifeEx is InvalidOperationException, "LifetimeOf");
+            T.Eq(0, TxTask.ActiveWaitCount, "登记表没有被改动");
+            // 立即完成的等待不需要登记，任何线程都可以
+            Exception? zeroEx = null;
+            var th2 = new Thread(() => { try { TxTask.Sleep(0).Wait(); } catch (Exception e) { zeroEx = e; } });
+            th2.Start(); th2.Join();
+            T.True(zeroEx is null, "Sleep(0)");
+        });
     }
 }

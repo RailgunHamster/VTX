@@ -112,6 +112,30 @@ namespace Godot.SourceGenerators
             defaultSeverity: DiagnosticSeverity.Error,
             isEnabledByDefault: true);
 
+        public static readonly DiagnosticDescriptor RuleBackgroundThread = new DiagnosticDescriptor(
+            id: "VTX013",
+            title: "后台线程里使用了只能在主线程使用的东西",
+            messageFormat: "{0}",
+            category: "VTX",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        public static readonly DiagnosticDescriptor RuleDiscardedDecides = new DiagnosticDescriptor(
+            id: "VTX014",
+            title: "返回 bool 的 [Decides] 方法的结果被丢弃，失败会被忽略",
+            messageFormat: "{0}",
+            category: "VTX",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        public static readonly DiagnosticDescriptor RuleUnrolledFailure = new DiagnosticDescriptor(
+            id: "VTX015",
+            title: "返回 bool 的 [Decides] 方法失败后，它已做的修改不会回滚",
+            messageFormat: "{0}",
+            category: "VTX",
+            defaultSeverity: DiagnosticSeverity.Warning,
+            isEnabledByDefault: true);
+
         public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics =>
             ImmutableArray.Create(
                 RuleNonTxMutation,
@@ -124,7 +148,10 @@ namespace Godot.SourceGenerators
                 RuleInvalidResPath,
                 RulePersistableSchemaBreak,
                 RulePureViolation,
-                RuleDiscardedSuspends);
+                RuleDiscardedSuspends,
+                RuleBackgroundThread,
+                RuleDiscardedDecides,
+                RuleUnrolledFailure);
 
         public override void Initialize(AnalysisContext context)
         {
@@ -162,6 +189,7 @@ namespace Godot.SourceGenerators
             context.RegisterSyntaxNodeAction(AnalyzeObjectCreation, SyntaxKind.ObjectCreationExpression, SyntaxKind.ImplicitObjectCreationExpression);
             context.RegisterSyntaxNodeAction(AnalyzeMemberAccess, SyntaxKind.SimpleMemberAccessExpression);
             context.RegisterSyntaxNodeAction(AnalyzeAwait, SyntaxKind.AwaitExpression);
+            context.RegisterSyntaxNodeAction(AnalyzeBackgroundName, SyntaxKind.IdentifierName, SyntaxKind.GenericName);
             context.RegisterSyntaxNodeAction(AnalyzeAsyncVoid,
                 SyntaxKind.MethodDeclaration,
                 SyntaxKind.LocalFunctionStatement,
@@ -891,6 +919,10 @@ namespace Godot.SourceGenerators
 
             var effects = GetEffects(methodSymbol);
 
+            // VTX014 / VTX015：返回 bool 的 [Decides] 方法（返回 false 即失败）
+            if ((effects & Effect.Decides) != 0 && methodSymbol.ReturnType.SpecialType == SpecialType.System_Boolean)
+                CheckBoolDecides(context, invocation, methodSymbol);
+
             var scope = FindScope(model, invocation, context.CancellationToken);
 
             if (scope == null || scope.Kind != ScopeKind.Tx)
@@ -1405,6 +1437,293 @@ namespace Godot.SourceGenerators
                 return true;
             return node.Parent is AssignmentExpressionSyntax assign && assign.Right == node &&
                    assign.Left is IdentifierNameSyntax id && id.Identifier.ValueText == "_";
+        }
+
+        // =====================================================================
+        // VTX014 / VTX015：不抛异常的失败（返回 bool 的 [Decides] 方法）
+        // =====================================================================
+
+        private static void CheckBoolDecides(SyntaxNodeAnalysisContext context, InvocationExpressionSyntax invocation, IMethodSymbol method)
+        {
+            var model = context.SemanticModel;
+            var ct = context.CancellationToken;
+            bool trusted = IsTrustedRuntimeType(method.ContainingType);
+            string name = $"{method.ContainingType?.Name}.{method.Name}";
+
+            if (IsDiscarded(invocation))
+            {
+                string msg = trusted
+                    ? $"'{name}' 的返回值被丢弃了：返回 false 时什么也不会发生，事务照常提交。写成 if (!{name}(...)) return false; 让失败传播，或改用会直接中断的 Tx.Check / Tx.Fail"
+                    : $"'{name}' 返回 false 表示失败，结果不能丢弃：写成 if (!{method.Name}(...)) return false; 让失败一路传播到 Tx.Try，或用 Tx.Try(state, static s => ...) 把它包成一个能单独回滚的保存点";
+                context.ReportDiagnostic(Diagnostic.Create(RuleDiscardedDecides, invocation.GetLocation(), msg));
+                return;
+            }
+
+            // Tx.Require / Tx.Failed 自己不改任何状态，失败后做别的事是安全的
+            if (trusted)
+                return;
+
+            if (FindScope(model, invocation, ct) == null)
+            {
+                context.ReportDiagnostic(Diagnostic.Create(RuleUnrolledFailure, invocation.GetLocation(),
+                    $"在事务之外调用了 '{name}'：它返回 false 时，已经做的修改不会回滚（事务外没有 Undo Log）。请在 Tx.Try(...) 里调用它"));
+                return;
+            }
+
+            if (IsUnsafeFallback(model, invocation, ct))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(RuleUnrolledFailure, invocation.GetLocation(),
+                    $"'{name}' 失败后这里继续执行了别的逻辑，但它失败前做的修改还留着。" +
+                    $"要么直接 return false / Tx.Fail 传播失败，要么用 Tx.Try(state, static s => s.{method.Name}(...)) 把它包成保存点（对应 Verse 的 A[] or B[]）"));
+            }
+        }
+
+        /// <summary>调用结果为 false 时，代码没有传播失败而是继续执行（if 的 false 分支、||、?: 的 false 分支）。</summary>
+        private static bool IsUnsafeFallback(SemanticModel model, InvocationExpressionSyntax invocation, System.Threading.CancellationToken ct)
+        {
+            SyntaxNode cond = invocation;
+            while (cond.Parent is ParenthesizedExpressionSyntax)
+                cond = cond.Parent;
+            bool negated = false;
+            if (cond.Parent is PrefixUnaryExpressionSyntax not && not.IsKind(SyntaxKind.LogicalNotExpression))
+            {
+                negated = true;
+                cond = not;
+                while (cond.Parent is ParenthesizedExpressionSyntax)
+                    cond = cond.Parent;
+            }
+
+            switch (cond.Parent)
+            {
+                case IfStatementSyntax ifs when ifs.Condition == cond:
+                {
+                    StatementSyntax? falseBranch = negated ? ifs.Statement : ifs.Else?.Statement;
+                    return falseBranch == null || !Propagates(model, falseBranch, ct);
+                }
+                case BinaryExpressionSyntax bin when bin.IsKind(SyntaxKind.LogicalOrExpression) && bin.Left == cond && !negated:
+                    return true;
+                case ConditionalExpressionSyntax ce when ce.Condition == cond:
+                {
+                    var falseExpr = negated ? ce.WhenTrue : ce.WhenFalse;
+                    return !IsFailureValue(model, falseExpr, ct);
+                }
+                default:
+                    return false;
+            }
+        }
+
+        private static bool Propagates(SemanticModel model, StatementSyntax statement, System.Threading.CancellationToken ct)
+        {
+            if (statement is BlockSyntax block)
+            {
+                if (block.Statements.Count == 0)
+                    return false;
+                statement = block.Statements[block.Statements.Count - 1];
+            }
+            switch (statement)
+            {
+                case ThrowStatementSyntax:
+                    return true;
+                case ReturnStatementSyntax ret:
+                    return ret.Expression != null && IsFailureValue(model, ret.Expression, ct);
+                case ExpressionStatementSyntax es when es.Expression is InvocationExpressionSyntax inv:
+                    return model.GetSymbolInfo(inv, ct).Symbol is IMethodSymbol m && IsVtxType(m.ContainingType, "Tx") && m.Name == "Fail";
+                default:
+                    return false;
+            }
+        }
+
+        private static bool IsFailureValue(SemanticModel model, ExpressionSyntax expr, System.Threading.CancellationToken ct)
+        {
+            expr = StripParenthesesAndSuppressions(expr);
+            if (expr.IsKind(SyntaxKind.FalseLiteralExpression))
+                return true;
+            return expr is InvocationExpressionSyntax inv &&
+                   model.GetSymbolInfo(inv, ct).Symbol is IMethodSymbol m &&
+                   IsVtxType(m.ContainingType, "Tx") && m.Name == "Failed";
+        }
+
+        // =====================================================================
+        // VTX013：后台线程（Task.Run / Parallel / ThreadPool / new Thread / WorkerThreadPool）
+        // =====================================================================
+
+        private enum ThreadDispatch
+        {
+            None,
+            Background,
+            MainThread,
+        }
+
+        private static readonly HashSet<string> ThreadSafeNodeMembers = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "CallDeferred", "SetDeferred", "CallDeferredThreadGroup", "SetDeferredThreadGroup", "NotifyDeferredThreadGroup",
+            "CallThreadSafe", "SetThreadSafe", "NotifyThreadSafe", "GetInstanceId",
+        };
+
+        private static void AnalyzeBackgroundName(SyntaxNodeAnalysisContext context)
+        {
+            var name = (SimpleNameSyntax)context.Node;
+            // 快速过滤：只有在 lambda 里才可能跑在后台线程
+            bool inLambda = false;
+            for (SyntaxNode? p = name.Parent; p != null; p = p.Parent)
+            {
+                if (p is AnonymousFunctionExpressionSyntax) { inLambda = true; break; }
+                if (p is MemberDeclarationSyntax) break;
+            }
+            if (!inLambda)
+                return;
+            if (name.Parent is QualifiedNameSyntax || name.Parent is NameColonSyntax || name.Parent is TypeArgumentListSyntax)
+                return;
+
+            var model = context.SemanticModel;
+            var ct = context.CancellationToken;
+            var sym = model.GetSymbolInfo(name, ct).Symbol;
+            if (sym is not IMethodSymbol && sym is not IPropertySymbol)
+                return;
+            if (sym is IMethodSymbol { MethodKind: MethodKind.Constructor or MethodKind.LocalFunction or MethodKind.AnonymousFunction })
+                return;
+
+            var bg = FindBackgroundLambda(model, name, ct);
+            if (bg == null)
+                return;
+
+            ExpressionSyntax? receiver = name.Parent is MemberAccessExpressionSyntax ma && ma.Name == name ? ma.Expression : null;
+            var containing = sym.ContainingType;
+            string member = $"{containing?.Name}.{sym.Name}";
+            string? message = null;
+
+            if (IsVtxType(containing, "TxTask"))
+            {
+                if (sym is IMethodSymbol && sym.Name is not ("Forget" or "Defer"))
+                    message = $"后台线程里调用了 '{member}'：TxTask 的等待登记表只能在主线程使用。先 await 回到主线程（不要 ConfigureAwait(false)），再等待";
+            }
+            else if (IsVtxType(containing, "TxGodot"))
+            {
+                message = $"后台线程里调用了 '{member}'：它修改的是 Godot 对象，只能在主线程。把计算结果带回主线程再写入";
+            }
+            else if (IsVtxType(containing, "Tx"))
+            {
+                if (sym is IMethodSymbol && sym.Name != "EnterWorkerScope" && !HasWorkerScope(model, bg, ct))
+                    message = $"后台线程里调用了 '{member}'：事务只能在主线程执行。如果是在后台线程对只属于这个线程的数据做推演，先写 using var scope = Tx.EnterWorkerScope();";
+            }
+            else if (sym is IPropertySymbol prop && IsTxFieldProperty(prop))
+            {
+                if (!HasWorkerScope(model, bg, ct) && !IsFreshReceiver(model, name, bg, ct))
+                    message = $"后台线程里访问了 [TxField] 属性 '{member}'：事务状态属于主线程，在这里读写会和主线程发生数据竞争。先在主线程把需要的值拷贝成局部变量再传进来";
+            }
+            else if (!sym.IsStatic && containing?.ContainingNamespace?.ToDisplayString() == "Godot" && !ThreadSafeNodeMembers.Contains(sym.Name))
+            {
+                ITypeSymbol? receiverType = receiver != null
+                    ? model.GetTypeInfo(receiver, ct).Type
+                    : model.GetEnclosingSymbol(name.SpanStart, ct)?.ContainingType;
+                if (InheritsFromName(receiverType, "Godot.Node") && !IsFreshReceiver(model, name, bg, ct))
+                    message = $"后台线程里访问了节点成员 '{member}'：场景树里的节点只能在主线程访问。先在主线程拷贝需要的数据，算完后 await 回主线程或用 CallDeferred 写回";
+            }
+
+            if (message != null)
+            {
+                Location loc = name.Parent is MemberAccessExpressionSyntax ma2 && ma2.Name == name ? ma2.GetLocation() : name.GetLocation();
+                context.ReportDiagnostic(Diagnostic.Create(RuleBackgroundThread, loc, message));
+            }
+        }
+
+        private static bool IsTxFieldProperty(IPropertySymbol prop)
+        {
+            var type = prop.ContainingType;
+            if (type == null)
+                return false;
+            foreach (var m in type.GetMembers())
+            {
+                if (m is IFieldSymbol f && HasVtxAttribute(f, "TxFieldAttribute") && GetTxFieldPropertyName(f) == prop.Name)
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>接收者是 lambda 里新建的局部对象（还没进场景树、没有共享）。</summary>
+        private static bool IsFreshReceiver(SemanticModel model, SimpleNameSyntax name, AnonymousFunctionExpressionSyntax bg, System.Threading.CancellationToken ct)
+        {
+            if (name.Parent is not MemberAccessExpressionSyntax ma || ma.Name != name)
+                return false; // 隐式 this
+            return IsFreshLocalReceiver(model, ma, new Scope { Kind = ScopeKind.Tx, Node = bg }, ct);
+        }
+
+        private static bool HasWorkerScope(SemanticModel model, AnonymousFunctionExpressionSyntax bg, System.Threading.CancellationToken ct)
+        {
+            foreach (var inv in bg.DescendantNodes().OfType<InvocationExpressionSyntax>())
+            {
+                if (inv.Expression.ToString().EndsWith("EnterWorkerScope", StringComparison.Ordinal) &&
+                    model.GetSymbolInfo(inv, ct).Symbol is IMethodSymbol m && IsVtxType(m.ContainingType, "Tx"))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>向外找：最近的“决定在哪个线程执行”的 lambda。传给后台 API 的返回它；传回主线程（CallDeferred / Post）的返回 null。</summary>
+        private static AnonymousFunctionExpressionSyntax? FindBackgroundLambda(SemanticModel model, SyntaxNode node, System.Threading.CancellationToken ct)
+        {
+            for (SyntaxNode? cur = node.Parent; cur != null; cur = cur.Parent)
+            {
+                switch (cur)
+                {
+                    case AnonymousFunctionExpressionSyntax anon:
+                        switch (DispatchOf(model, anon, ct))
+                        {
+                            case ThreadDispatch.Background: return anon;
+                            case ThreadDispatch.MainThread: return null;
+                        }
+                        break;
+                    case LocalFunctionStatementSyntax:
+                    case MemberDeclarationSyntax:
+                        return null;
+                }
+            }
+            return null;
+        }
+
+        private static ThreadDispatch DispatchOf(SemanticModel model, AnonymousFunctionExpressionSyntax anon, System.Threading.CancellationToken ct)
+        {
+            SyntaxNode node = anon;
+            for (int hop = 0; hop < 2; hop++)
+            {
+                while (node.Parent is ParenthesizedExpressionSyntax || node.Parent is CastExpressionSyntax)
+                    node = node.Parent;
+                if (node.Parent is not ArgumentSyntax arg || arg.Parent?.Parent is not ExpressionSyntax callee)
+                    return ThreadDispatch.None;
+                if (model.GetSymbolInfo(callee, ct).Symbol is not IMethodSymbol m)
+                    return ThreadDispatch.None;
+
+                string type = m.ContainingType?.OriginalDefinition.ToDisplayString() ?? string.Empty;
+                if (m.MethodKind == MethodKind.Constructor)
+                    return type == "System.Threading.Thread" ? ThreadDispatch.Background : ThreadDispatch.None;
+
+                if ((type == "System.Threading.Tasks.Task" && m.Name == "Run") ||
+                    (type.StartsWith("System.Threading.Tasks.TaskFactory", StringComparison.Ordinal) && m.Name == "StartNew") ||
+                    (type == "System.Threading.ThreadPool" && m.Name.EndsWith("QueueUserWorkItem", StringComparison.Ordinal)) ||
+                    type == "System.Threading.Tasks.Parallel" ||
+                    (type == "Godot.WorkerThreadPool" && m.Name is "AddTask" or "AddGroupTask"))
+                {
+                    return ThreadDispatch.Background;
+                }
+                if (type == "System.Threading.SynchronizationContext" && m.Name is "Post" or "Send")
+                    return ThreadDispatch.MainThread;
+
+                if (type == "Godot.Callable" && m.Name == "From")
+                {
+                    // Callable.From(...).CallDeferred()：回到主线程；作为参数传给 WorkerThreadPool：看下一层
+                    if (callee.Parent is MemberAccessExpressionSyntax next && next.Expression == callee &&
+                        next.Name.Identifier.ValueText is "CallDeferred")
+                    {
+                        return ThreadDispatch.MainThread;
+                    }
+                    node = callee;
+                    continue;
+                }
+                return ThreadDispatch.None;
+            }
+            return ThreadDispatch.None;
         }
 
         private static void AnalyzeAsyncVoid(SyntaxNodeAnalysisContext context)

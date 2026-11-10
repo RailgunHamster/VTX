@@ -12,6 +12,9 @@ namespace VTX;
 /// 2. [CallerArgumentExpression] 自动失败原因捕获（LastFailReason）；
 /// 3. FirstOf / WhereCan 多候选回溯搜索；
 /// 4. [TxInvariant] 提交前类不变量契约自动校验。
+/// 5. 两种失败方式：Tx.Check / Tx.Fail 用内部异常立即中断（写起来最短）；
+///    返回 bool 的 [Decides] 方法用 Tx.Require / Tx.Failed 返回 false（不抛异常，约快 30 倍，适合热路径）。
+/// 6. 只能在主线程使用；后台线程推演独立数据时用 <see cref="EnterWorkerScope"/>。
 /// </summary>
 public static class Tx
 {
@@ -107,7 +110,25 @@ public static class Tx
     [ThreadStatic] private static List<Action>? _deferredCommits;
     [ThreadStatic] private static List<ITxObject>? _touchedObjects;
     [ThreadStatic] private static HashSet<ITxObject>? _touchedSet;
-    [ThreadStatic] private static string? _lastFailReason;
+    [ThreadStatic] private static int _workerScopeDepth;
+
+    // 失败原因延迟格式化：失败时只记下原因和条件表达式，读取 LastFailReason 时才拼字符串，
+    // 这样失败路径本身不分配内存。
+    private enum FailKind : byte
+    {
+        None,
+        Message,
+        Condition,
+        NotNullRef,
+        NotNullValue,
+        BodyReturnedFalse,
+    }
+
+    [ThreadStatic] private static FailKind _failKind;
+    [ThreadStatic] private static string? _failReason;
+    [ThreadStatic] private static string? _failExpr;
+    [ThreadStatic] private static string? _failText;
+    [ThreadStatic] private static int _failSeq;
 
     /// <summary>当前是否处于事务上下文中。</summary>
     public static bool IsActive
@@ -132,8 +153,27 @@ public static class Tx
     /// </summary>
     public static string? LastFailReason
     {
-        [Pure] get => _lastFailReason;
+        [Pure] get => _failText ??= FormatFail(_failKind, _failReason, _failExpr);
     }
+
+    private static void SetFail(FailKind kind, string? reason, string? expr)
+    {
+        _failKind = kind;
+        _failReason = reason;
+        _failExpr = expr;
+        _failText = null;
+        _failSeq++;
+    }
+
+    private static string? FormatFail(FailKind kind, string? reason, string? expr) => kind switch
+    {
+        FailKind.Message => reason,
+        FailKind.Condition => string.IsNullOrEmpty(reason) ? expr : $"{reason} ({expr})",
+        FailKind.NotNullRef => string.IsNullOrEmpty(reason) ? $"{expr} is not null" : $"{reason} ({expr} is not null)",
+        FailKind.NotNullValue => string.IsNullOrEmpty(reason) ? $"{expr}.HasValue" : $"{reason} ({expr}.HasValue)",
+        FailKind.BodyReturnedFalse => "Transaction body returned false",
+        _ => null,
+    };
 
     // ---------------------------------------------------------------------
     // 事务核心：所有 Try / Simulate 重载都走同一条路径。
@@ -175,8 +215,33 @@ public static class Tx
         }
     }
 
+    private struct StatePredicateBody<TState> : IBody
+    {
+        public Func<TState, bool> Func;
+        public TState State;
+        public bool Invoke() => Func(State);
+    }
+
+    private struct CandidateActionBody<T> : IBody
+    {
+        public Action<T> Action;
+        public T Candidate;
+        public bool Invoke()
+        {
+            Action(Candidate);
+            return true;
+        }
+    }
+
     private static bool Run<TBody>(ref TBody body, bool simulate) where TBody : struct, IBody
     {
+        if (_workerScopeDepth == 0 && !VtxThread.IsMainThread)
+        {
+            throw new InvalidOperationException(
+                "VTX: 事务只能在主线程执行（当前在后台线程）。" +
+                "如果是在后台线程对只属于这个线程的数据做推演，先 using var scope = Tx.EnterWorkerScope();");
+        }
+
         var undoLog = _undoLog ??= new List<IUndoStep>(64);
         var deferred = _deferredCommits ??= new List<Action>(16);
         var touched = _touchedObjects ??= new List<ITxObject>(16);
@@ -193,9 +258,12 @@ public static class Tx
         int touchedSavepoint = touched.Count;
         if (entryDepth == 0)
         {
-            _lastFailReason = null;
+            _failKind = FailKind.None;
+            _failReason = null;
+            _failExpr = null;
+            _failText = null;
         }
-        string? reasonAtEntry = _lastFailReason;
+        int failSeqAtEntry = _failSeq;
         _depth = entryDepth + 1;
 
         bool ok;
@@ -206,9 +274,9 @@ public static class Tx
             {
                 ValidateTouchedInvariants(touched, touchedSavepoint);
             }
-            else if (ReferenceEquals(_lastFailReason, reasonAtEntry))
+            else if (_failSeq == failSeqAtEntry)
             {
-                _lastFailReason = "Transaction body returned false";
+                SetFail(FailKind.BodyReturnedFalse, null, null);
             }
         }
         catch (TxFailSignal)
@@ -255,12 +323,13 @@ public static class Tx
         ArgumentNullException.ThrowIfNull(body);
         var b = new ActionBody { Action = body };
         bool ok = Run(ref b, simulate: false);
-        failReason = ok ? null : _lastFailReason;
+        failReason = ok ? null : LastFailReason;
         return ok;
     }
 
     /// <summary>
     /// 执行返回布尔值的可回滚事务块（无异常快速路径：返回 false 或调用 Tx.Fail() 均会自动回滚）。
+    /// 失败原因可以从 <see cref="LastFailReason"/> 读取（需要 out 参数时用 Try(state, body, out reason)）。
     /// </summary>
     [Transacts]
     public static bool Try([Transacts] Func<bool> body)
@@ -268,6 +337,31 @@ public static class Tx
         ArgumentNullException.ThrowIfNull(body);
         var b = new PredicateBody { Func = body };
         return Run(ref b, simulate: false);
+    }
+
+    /// <summary>
+    /// 零分配版本：把需要的对象作为 state 传进来，body 写成 static lambda，就不会为闭包分配内存。
+    /// body 返回 false（例如 <c>return Tx.Failed("金币不足")</c>）即失败回滚，不抛异常。
+    /// 在事务内部调用时就是一个“保存点”：失败只回滚这一段，适合实现 Verse 的 <c>A[] or B[]</c>。
+    /// <code>if (!Tx.Try(this, static s => s.TryBuy(10))) { ... }</code>
+    /// </summary>
+    [Transacts]
+    public static bool Try<TState>(TState state, [Transacts] Func<TState, bool> body)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        var b = new StatePredicateBody<TState> { Func = body, State = state };
+        return Run(ref b, simulate: false);
+    }
+
+    /// <summary>零分配版本的 Try，并在失败时输出原因。</summary>
+    [Transacts]
+    public static bool Try<TState>(TState state, [Transacts] Func<TState, bool> body, out string? failReason)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        var b = new StatePredicateBody<TState> { Func = body, State = state };
+        bool ok = Run(ref b, simulate: false);
+        failReason = ok ? null : LastFailReason;
+        return ok;
     }
 
     /// <summary>
@@ -301,7 +395,7 @@ public static class Tx
         ArgumentNullException.ThrowIfNull(body);
         var b = new ActionBody { Action = body };
         bool ok = Run(ref b, simulate: true);
-        failReason = ok ? null : _lastFailReason;
+        failReason = ok ? null : LastFailReason;
         return ok;
     }
 
@@ -315,6 +409,26 @@ public static class Tx
         var b = new ResultBody<TResult> { Func = body };
         bool ok = Run(ref b, simulate: true);
         result = ok ? b.Result : default;
+        return ok;
+    }
+
+    /// <summary>零分配版本的 Simulate：试跑后 100% 回滚。body 返回 false 即判定失败。</summary>
+    [Pure]
+    public static bool Simulate<TState>(TState state, [Transacts] Func<TState, bool> body)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        var b = new StatePredicateBody<TState> { Func = body, State = state };
+        return Run(ref b, simulate: true);
+    }
+
+    /// <summary>零分配版本的 Simulate，并在失败时输出原因。</summary>
+    [Pure]
+    public static bool Simulate<TState>(TState state, [Transacts] Func<TState, bool> body, out string? failReason)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        var b = new StatePredicateBody<TState> { Func = body, State = state };
+        bool ok = Run(ref b, simulate: true);
+        failReason = ok ? null : LastFailReason;
         return ok;
     }
 
@@ -335,10 +449,37 @@ public static class Tx
 
         foreach (T candidate in candidates)
         {
-            T current = candidate;
-            if (Try(() => action(current)))
+            var b = new CandidateActionBody<T> { Action = action, Candidate = candidate };
+            if (Run(ref b, simulate: false))
             {
-                chosen = current;
+                chosen = candidate;
+                return true;
+            }
+        }
+
+        chosen = default;
+        return false;
+    }
+
+    /// <summary>
+    /// FirstOf 的不抛异常版本：action 返回 false 表示这个候选失败（回滚它的修改，试下一个）。
+    /// 用 static lambda 时整个搜索不为闭包分配内存。
+    /// </summary>
+    [Transacts]
+    public static bool FirstOf<T>(
+        IEnumerable<T> candidates,
+        [Transacts] Func<T, bool> action,
+        [MaybeNullWhen(false)] out T chosen)
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+        ArgumentNullException.ThrowIfNull(action);
+
+        foreach (T candidate in candidates)
+        {
+            var b = new StatePredicateBody<T> { Func = action, State = candidate };
+            if (Run(ref b, simulate: false))
+            {
+                chosen = candidate;
                 return true;
             }
         }
@@ -361,13 +502,37 @@ public static class Tx
         var validList = new List<T>();
         foreach (T candidate in candidates)
         {
-            T current = candidate;
-            if (Simulate(() => action(current)))
+            var b = new CandidateActionBody<T> { Action = action, Candidate = candidate };
+            if (Run(ref b, simulate: true))
             {
-                validList.Add(current);
+                validList.Add(candidate);
             }
         }
         return validList;
+    }
+
+    /// <summary>
+    /// WhereCan 的不抛异常、可复用结果列表版本：action 返回 false 表示这个候选不合法。
+    /// 合法候选追加到 results（不会先清空），返回追加的个数。适合每帧大量枚举（AI 搜索、落点高亮）。
+    /// </summary>
+    [Pure]
+    public static int WhereCan<T>(IEnumerable<T> candidates, [Transacts] Func<T, bool> action, List<T> results)
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+        ArgumentNullException.ThrowIfNull(action);
+        ArgumentNullException.ThrowIfNull(results);
+
+        int added = 0;
+        foreach (T candidate in candidates)
+        {
+            var b = new StatePredicateBody<T> { Func = action, State = candidate };
+            if (Run(ref b, simulate: true))
+            {
+                results.Add(candidate);
+                added++;
+            }
+        }
+        return added;
     }
 
     /// <summary>
@@ -381,7 +546,7 @@ public static class Tx
     {
         if (!condition)
         {
-            FailCore(string.IsNullOrEmpty(reason) ? expr : $"{reason} ({expr})");
+            FailCore(FailKind.Condition, reason, expr);
         }
     }
 
@@ -391,7 +556,34 @@ public static class Tx
     [Decides, DoesNotReturn]
     public static void Fail(string? reason = null)
     {
-        FailCore(reason ?? "Tx.Fail()");
+        FailCore(FailKind.Message, reason ?? "Tx.Fail()", null);
+    }
+
+    /// <summary>
+    /// 不抛异常的条件检查：条件成立返回 true；不成立时记录失败原因（或条件源码表达式）并返回 false。
+    /// 用在返回 bool 的 [Decides] 方法里：<c>if (!Tx.Require(Gold >= price, "金币不足")) return false;</c>
+    /// 失败要靠返回值一路传播到 Tx.Try(Func&lt;bool&gt;)，那里会回滚整个事务。
+    /// </summary>
+    [Decides]
+    public static bool Require(
+        bool condition,
+        string? reason = null,
+        [CallerArgumentExpression(nameof(condition))] string? expr = null)
+    {
+        if (condition)
+            return true;
+        SetFail(FailKind.Condition, reason, expr);
+        return false;
+    }
+
+    /// <summary>
+    /// 不抛异常的失败：记录原因并返回 false。用法：<c>if (target is null) return Tx.Failed("没有目标");</c>
+    /// </summary>
+    [Decides]
+    public static bool Failed(string? reason = null)
+    {
+        SetFail(FailKind.Message, reason ?? "Tx.Failed()", null);
+        return false;
     }
 
     /// <summary>
@@ -400,14 +592,14 @@ public static class Tx
     /// 而不是让内部信号类型泄漏给调用方。
     /// </summary>
     [DoesNotReturn]
-    private static void FailCore(string? reason)
+    private static void FailCore(FailKind kind, string? reason, string? expr)
     {
-        _lastFailReason = reason;
+        SetFail(kind, reason, expr);
         if (_depth > 0)
         {
             throw TxFailSignal.Instance;
         }
-        throw new TxFailedException(reason);
+        throw new TxFailedException(LastFailReason);
     }
 
     /// <summary>
@@ -418,7 +610,7 @@ public static class Tx
     {
         if (_depth > 0)
         {
-            _lastFailReason = reason;
+            SetFail(FailKind.Message, reason, null);
             throw TxFailSignal.Instance;
         }
         throw outsideTransaction;
@@ -438,7 +630,7 @@ public static class Tx
     {
         if (value is null)
         {
-            FailCore(string.IsNullOrEmpty(reason) ? $"{expr} is not null" : $"{reason} ({expr} is not null)");
+            FailCore(FailKind.NotNullRef, reason, expr);
         }
         return value;
     }
@@ -455,7 +647,7 @@ public static class Tx
     {
         if (!value.HasValue)
         {
-            FailCore(string.IsNullOrEmpty(reason) ? $"{expr}.HasValue" : $"{reason} ({expr}.HasValue)");
+            FailCore(FailKind.NotNullValue, reason, expr);
         }
         return value.Value;
     }
@@ -486,6 +678,8 @@ public static class Tx
         ArgumentNullException.ThrowIfNull(restore);
         if (_depth > 0)
         {
+            if (_workerScopeDepth > 0)
+                EnsureNotGodotObject(owner);
             (_undoLog ??= new List<IUndoStep>(64)).Add(UndoStep<TOwner, TValue>.Rent(owner, oldValue, restore));
             if (owner is ITxObject txObj)
             {
@@ -507,6 +701,8 @@ public static class Tx
         ArgumentNullException.ThrowIfNull(restore);
         if (_depth > 0)
         {
+            if (_workerScopeDepth > 0)
+                EnsureNotGodotObject(owner);
             (_undoLog ??= new List<IUndoStep>(64)).Add(UndoStep<TOwner, TArg1, TArg2>.Rent(owner, arg1, arg2, restore));
             if (owner is ITxObject txObj)
             {
@@ -530,6 +726,48 @@ public static class Tx
         else
         {
             commitAction();
+        }
+    }
+
+    /// <summary>
+    /// 声明“当前后台线程要对只属于它自己的数据开事务”（例如 AI 在一份棋盘拷贝上做 Simulate 搜索）。
+    /// 在作用域内允许 Tx.Try / Simulate；但事务里碰到 Godot 对象（节点、资源）仍然会抛异常。
+    /// 每个线程有自己的 Undo Log，互不干扰；但被多个线程同时修改的 [TxField] 对象仍然是数据竞争，需要你保证数据只属于这个线程。
+    /// 在主线程调用时什么也不做。
+    /// <code>await Task.Run(() => { using var scope = Tx.EnterWorkerScope(); return Search(boardCopy); });</code>
+    /// </summary>
+    public static WorkerScope EnterWorkerScope()
+    {
+        if (VtxThread.IsMainThread)
+            return default;
+        _workerScopeDepth++;
+        return new WorkerScope(active: true);
+    }
+
+    /// <summary><see cref="EnterWorkerScope"/> 返回的作用域，离开 using 时结束。不能跨 await 使用。</summary>
+    public ref struct WorkerScope
+    {
+        private bool _active;
+
+        internal WorkerScope(bool active) => _active = active;
+
+        public void Dispose()
+        {
+            if (_active)
+            {
+                _active = false;
+                _workerScopeDepth--;
+            }
+        }
+    }
+
+    private static void EnsureNotGodotObject<TOwner>(TOwner owner)
+    {
+        if (owner is Godot.GodotObject)
+        {
+            throw new InvalidOperationException(
+                "VTX: 后台线程的事务里不能修改 Godot 对象（" + owner.GetType().Name + "）。" +
+                "Godot 对象只能在主线程修改：把计算结果带回主线程，再在主线程的事务里写入。");
         }
     }
 

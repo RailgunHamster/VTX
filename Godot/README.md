@@ -14,14 +14,15 @@ Godot/
 │   └── Examples.cs             # 涵盖全部 VTX 特性的完整可编译代码示例
 ├── runtime/                    # 链接编译进 GodotSharp.dll (namespace VTX)
 │   ├── VtxAttributes.cs        # [TxField], [TxInvariant], [TxPersistable], [Transacts], [Decides], [Suspends], [Pure], [NoRollback]
-│   ├── Tx.cs                   # 事务运行时：Tx.Try, Tx.Simulate, Tx.FirstOf, Tx.WhereCan, Tx.Check, Tx.NotNull, Tx.Record, Tx.Defer
+│   ├── Tx.cs                   # 事务运行时：Tx.Try, Tx.Simulate, Tx.FirstOf, Tx.WhereCan, Tx.Check/Fail/NotNull（抛异常）, Tx.Require/Failed（返回 false）, Tx.Record, Tx.Defer, Tx.EnterWorkerScope
 │   ├── TxCollections.cs        # O(1) 增量回滚容器：TxArray<T>, TxList<T>, TxDict<TKey, TValue>
 │   ├── TxRandom.cs             # 确定性可回滚伪随机数生成器（保证 Simulate 预览与 Try 真跑结果一致）
 │   ├── TxGodot.cs              # Godot 节点事务安全封装：SetPosition/Rotation/Visible + 延迟节点树/信号操作
+│   ├── VtxThread.cs            # 主线程判断（每个线程只问引擎一次）
 │   └── TxTask.cs               # 帧同步结构化并发：Race, Sync, Rush, WithScope+Branch, Defer, Sleep, NextFrame/DelayFrames/NextPhysicsFrame, WaitUntil, WaitSignal<T>, LifetimeOf, Forget, GetActiveWaits
 └── analyzers/                  # 链接编译进 Godot.SourceGenerators.dll
     ├── TxFieldGenerator.cs     # [TxField] 属性/快照/Diff/JSON 生成器 + VTX.Res 强类型资产清单生成器
-    └── VtxAnalyzer.cs          # Roslyn 静态分析器（强制拦截 VTX001 ~ VTX010、VTX012；VTX011 由生成器报告）
+    └── VtxAnalyzer.cs          # Roslyn 静态分析器（强制拦截 VTX001 ~ VTX010、VTX012 ~ VTX015；VTX011 由生成器报告）
 ```
 
 ---
@@ -59,6 +60,10 @@ dotnet run                 # 全部测试
 dotnet run -- Analyzer     # 只跑名称包含 Analyzer 的测试
 $env:VTX_TEST_DUMP="D:\tmp\vtx-gen"; dotnet run -- 07_   # 把生成器输出写到目录里查看
 ```
+
+桩测试覆盖不到真实引擎的时序（暂停、时间缩放、信号、节点释放、线程）。真实引擎验收在 `godot-test/demo/vtx_demo/`：
+`run_vtx_demo.bat` 会重新生成 GodotSharp、编译 godot-test，并以 headless + 固定 60 帧/秒运行 `VtxDemo.tscn`，
+每项检查在 `last_run/3_godot.log` 里打印一行 `[VTX-DEMO] PASS/FAIL`，退出码 0 表示全部通过。
 
 ## 使用说明与 AI 编码规范
 

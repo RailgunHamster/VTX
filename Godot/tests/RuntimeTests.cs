@@ -288,6 +288,101 @@ internal static class RuntimeTests
             T.True(!otherActive, "其它线程不在事务中");
         });
 
+        T.Add("Tx: 不抛异常的失败（Require / Failed）同样整体回滚", () =>
+        {
+            var w = new Wallet { Gold = 10 };
+            var log = new TxList<string>();
+            static bool Buy(Wallet w, TxList<string> log, int price)
+            {
+                log.Add("buy " + price);
+                if (!Tx.Require(w.Gold >= price, "金币不足")) return false;
+                w.Gold -= price;
+                return true;
+            }
+            T.True(Tx.Try(() => Buy(w, log, 3) && Buy(w, log, 4)), "两次都买得起");
+            T.Eq(3, w.Gold, "扣款");
+            T.True(!Tx.Try((w, log), static s => Buy(s.w, s.log, 2) && Buy(s.w, s.log, 5), out var why), "第二次买不起");
+            T.Eq(3, w.Gold, "第一次的扣款也回滚");
+            T.Eq(2, log.Count, "日志回滚");
+            T.Eq("金币不足 (w.Gold >= price)", why, "原因");
+            T.True(!Tx.Try(() => Tx.Failed("没有目标")), "Failed");
+            T.Eq("没有目标", Tx.LastFailReason, "Failed 原因");
+            T.True(!Tx.Try(() => false), "直接返回 false");
+            T.Eq("Transaction body returned false", Tx.LastFailReason, "默认原因");
+            T.True(!Tx.Try(() => Tx.Require(1 > 2)), "无原因的 Require");
+            T.Eq("1 > 2", Tx.LastFailReason, "条件表达式");
+            T.True(Tx.Require(true), "事务外 Require(true)");
+            T.True(!Tx.Require(false), "事务外 Require(false) 只返回 false 不抛异常");
+        });
+
+        T.Add("Tx: 失败原因延迟格式化后与以前一致", () =>
+        {
+            string? s = null;
+            int? n = null;
+            T.True(!Tx.Try(() => Tx.Check(1 > 2, "r")), "Check"); T.Eq("r (1 > 2)", Tx.LastFailReason, "Check 带原因");
+            T.True(!Tx.Try(() => Tx.Check(1 > 2)), "Check"); T.Eq("1 > 2", Tx.LastFailReason, "Check 无原因");
+            T.True(!Tx.Try(() => { Tx.NotNull(s); }), "NotNull"); T.Eq("s is not null", Tx.LastFailReason, "NotNull 引用");
+            T.True(!Tx.Try(() => { Tx.NotNull(n, "要数字"); }), "NotNull?"); T.Eq("要数字 (n.HasValue)", Tx.LastFailReason, "NotNull 值");
+            T.True(!Tx.Try(() => Tx.Fail()), "Fail"); T.Eq("Tx.Fail()", Tx.LastFailReason, "Fail 默认");
+            var ex = T.Throws<TxFailedException>(() => Tx.Check(false, "外面"), "事务外");
+            T.Eq("外面 (false)", ex.Reason, "事务外原因");
+            T.True(Tx.Try(() => { }), "成功"); T.Eq(null, Tx.LastFailReason, "顶层成功后清空");
+        });
+
+        T.Add("Tx: 零分配重载——Try/Simulate(state)、保存点、FirstOf/WhereCan(Func)", () =>
+        {
+            var w = new Wallet { Gold = 10 };
+            // 事务内的 Try(state) 是保存点：A 失败只回滚 A，再试 B（Verse 的 A[] or B[]）
+            T.True(Tx.Try(w, static w =>
+            {
+                w.Gold -= 1;
+                if (!Tx.Try(w, static w => { w.Gold -= 100; return Tx.Require(w.Gold >= 0); }))
+                    w.Gold -= 2;
+                return true;
+            }), "外层提交");
+            T.Eq(7, w.Gold, "A 回滚、B 生效");
+            T.True(Tx.Simulate(w, static w => { w.Gold = 0; return true; }), "Simulate 成功");
+            T.Eq(7, w.Gold, "Simulate 回滚");
+            T.True(!Tx.Simulate(w, static w => Tx.Failed("x"), out var r) && r == "x", "Simulate 失败原因");
+
+            int[] cands = { 9, 8, 5, 3 };
+            T.True(Tx.FirstOf(cands, c => { w.Gold -= c; return Tx.Require(w.Gold >= 0); }, out int chosen), "FirstOf");
+            T.Eq(5, chosen, "第一个买得起的"); T.Eq(2, w.Gold, "只保留成功候选的修改");
+            var results = new List<int> { -1 };
+            int added = Tx.WhereCan(cands, c => { w.Gold -= c; return w.Gold >= 0; }, results);
+            T.Eq(0, added, "都买不起"); T.Eq(1, results.Count, "不清空结果列表");
+            w.Gold = 100;
+            T.Eq(4, Tx.WhereCan(cands, c => { w.Gold -= c; return w.Gold >= 0; }, results), "都买得起");
+            T.Eq(100, w.Gold, "WhereCan 不留修改");
+        });
+
+        T.Add("线程规则：后台线程不能开事务，除非 EnterWorkerScope；Worker 里不能改 Godot 对象", () =>
+        {
+            Exception? noScope = null, godotObj = null;
+            bool scopedOk = false;
+            int scopedGold = -1;
+            var th = new Thread(() =>
+            {
+                try { Tx.Try(() => { }); } catch (Exception e) { noScope = e; }
+                using (var scope = Tx.EnterWorkerScope())
+                {
+                    var w = new Wallet { Gold = 5 };
+                    scopedOk = !Tx.Try(() => { w.Gold = 1; Tx.Fail(); });
+                    scopedGold = w.Gold;
+                    var n = new Node3D();
+                    try { Tx.Try(() => TxGodot.SetPosition(n, new Vector3(1, 0, 0))); } catch (Exception e) { godotObj = e; }
+                }
+                // 作用域结束后又不允许了
+                try { Tx.Try(() => { }); noScope = noScope is null ? new Exception("作用域结束后仍允许") : noScope; } catch (InvalidOperationException) { }
+            });
+            th.Start(); th.Join();
+            T.True(noScope is InvalidOperationException && noScope.Message.Contains("主线程"), "无作用域时报错");
+            T.True(scopedOk && scopedGold == 5, "作用域内正常回滚");
+            T.True(godotObj is InvalidOperationException && godotObj.Message.Contains("Godot 对象"), "Worker 事务里改 Godot 对象报错");
+            T.Eq(0, Tx.Depth, "主线程深度不受影响");
+            using (Tx.EnterWorkerScope()) { T.True(Tx.Try(() => { }), "主线程上 EnterWorkerScope 是空操作"); }
+        });
+
         T.Add("TxGodot: 属性回滚、延迟节点树操作与信号", () =>
         {
             var n3 = new Node3D(); var n2 = new Node2D(); var parent = new Node(); var child = new Node();

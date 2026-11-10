@@ -108,7 +108,7 @@ internal static class AnalyzerTests
     }
 
     private static IEnumerable<string> RuntimeSourceFiles() =>
-        new[] { "VtxAttributes.cs", "Tx.cs", "TxCollections.cs", "TxRandom.cs", "TxGodot.cs", "TxTask.cs" }
+        new[] { "VtxAttributes.cs", "Tx.cs", "TxCollections.cs", "TxRandom.cs", "TxGodot.cs", "TxTask.cs", "VtxThread.cs" }
             .Select(f => Path.Combine(BaseDir, "sources", "runtime", f))
             .Append(Path.Combine(BaseDir, "sources", "GodotStubs.cs"));
 
@@ -250,6 +250,8 @@ internal static class AnalyzerTests
             {
                 ms.Position = 0;
                 var asm = alc.LoadFromStream(ms);
+                // 用例程序集里有自己的一份 Godot 桩：把当前线程登记为它的主线程
+                asm.GetType("Godot.OS")?.GetField("TestMainThreadId")?.SetValue(null, (ulong)Environment.CurrentManagedThreadId);
                 var run = asm.GetTypes().First(t => t.Name == "CaseRun").GetMethod("Run", BindingFlags.Public | BindingFlags.Static)!;
                 string outcome;
                 try { outcome = (string)run.Invoke(null, null)!; }

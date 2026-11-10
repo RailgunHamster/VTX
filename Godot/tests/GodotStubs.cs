@@ -43,6 +43,12 @@ namespace Godot
         public static Callable From<[MustBeVariant] T0>(Action<T0> action) => new(action);
         public static Callable From<[MustBeVariant] T0, [MustBeVariant] T1>(Action<T0, T1> action) => new(action);
         public static Callable From<[MustBeVariant] T0, [MustBeVariant] T1, [MustBeVariant] T2>(Action<T0, T1, T2> action) => new(action);
+        public void CallDeferred(params Variant[] args) { }
+    }
+
+    public static class WorkerThreadPool
+    {
+        public static long AddTask(Callable action, bool highPriority = false, string description = "") => 0;
     }
 
     public struct Vector2 : IEquatable<Vector2>
@@ -93,6 +99,8 @@ namespace Godot
 
         // ---- GodotSharp API 形状 ----
         public static bool IsInstanceValid(GodotObject? instance) => instance is not null && !instance._freed;
+        public void CallDeferred(StringName method, params Variant[] args) { }
+        public ulong GetInstanceId() => 0;
         public void Free() { AssertMainThread("Free"); _freed = true; }
         public Variant Get(StringName property) { AssertMainThread("Get"); return _props.TryGetValue(property.Name, out var v) ? v : default; }
         public void Set(StringName property, Variant value) { AssertMainThread("Set"); _props[property.Name] = value; }
@@ -179,6 +187,14 @@ namespace Godot
         public static SceneTree? Tree = new();
         public static ulong GetProcessFrames() => Frames;
         public static MainLoop? GetMainLoop() => Tree;
+    }
+
+    public static class OS
+    {
+        // 测试主线程由 Program.Main 设置
+        public static ulong TestMainThreadId;
+        public static ulong GetMainThreadId() => TestMainThreadId;
+        public static ulong GetThreadCallerId() => (ulong)System.Environment.CurrentManagedThreadId;
     }
 
     public static class GD
