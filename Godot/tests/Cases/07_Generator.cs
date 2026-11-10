@@ -19,21 +19,21 @@ namespace Game
     public partial class BaseC
     {
         [TxField] private int _a;
-        [TxInvariant] private void CheckA() => Tx.Check(A >= 0, "A 不能为负");
+        [TxInvariant] private bool CheckA() => Tx.Require(A >= 0, "A 不能为负");
     }
 
     public partial class DerivedC : BaseC
     {
         [TxField] private int _b;
-        [TxInvariant] private void CheckB() => Tx.Check(B >= 0, "B 不能为负");
+        [TxInvariant] private bool CheckB() => Tx.Require(B >= 0, "B 不能为负");
     }
 
-    public sealed partial class SealedC { [TxField] private int _v; [TxInvariant] private void Check() => Tx.Check(V < 100); }
+    public sealed partial class SealedC { [TxField] private int _v; [TxInvariant] private bool Check() => V < 100; }
 
     public partial class OnlyInvariant
     {
         public int X;
-        [TxInvariant] private void Check() => Tx.Check(X >= 0, "X");
+        [TxInvariant] private bool Check() => Tx.Require(X >= 0, "X");
     }
 
     public partial struct S { [TxField] private int _v; }                                  // expect: VTX011
@@ -46,6 +46,7 @@ namespace Game
     {
         [TxField] private int _x;
         [TxInvariant] private bool Bad(int a) => a > 0;                                    // expect: VTX011
+        [TxInvariant] private void Old() { }                                               // expect: VTX011
     }
 }
 
@@ -54,12 +55,12 @@ public static class CaseRun
     public static string Run()
     {
         var inner = new Game.Outer.Inner();
-        Tx.Try(() => { inner.Hp = 5; Tx.Fail(); });
+        Tx.Try(inner, static i => { i.Hp = 5; return false; });
         if (inner.Hp != 0) return "嵌套类回滚失败";
 
         var box = new Game.Box<string>();
         if (!Tx.Try(() => { box.Item = "x"; box.Count = 2; })) return "泛型类提交失败";
-        Tx.Try(() => { box.Item = null; Tx.Fail(); });
+        Tx.Try(box, static b => { b.Item = null; return Tx.Failed(); });
         if (box.Item != "x") return "泛型类回滚失败";
 
         var d = new Game.DerivedC();

@@ -490,5 +490,23 @@ internal static class TaskTests
             th2.Start(); th2.Join();
             T.True(zeroEx is null, "Sleep(0)");
         });
+
+        T.Add("TxTask.SwitchToMainThread：从后台线程回到主线程", () =>
+        {
+            Start();
+            int mainId = Environment.CurrentManagedThreadId;
+            int before = -1, after = -1;
+            var t = MainThread.RunFrames(async () =>
+            {
+                await Task.Run(() => { }).ConfigureAwait(false);
+                before = Environment.CurrentManagedThreadId;
+                await TxTask.SwitchToMainThread();
+                after = Environment.CurrentManagedThreadId;
+                await TxTask.SwitchToMainThread(); // 已在主线程：立即继续
+            }, 50);
+            T.True(t.IsCompletedSuccessfully, "完成");
+            T.True(before != mainId, "ConfigureAwait(false) 之后在线程池");
+            T.Eq(mainId, after, "回到主线程");
+        });
     }
 }

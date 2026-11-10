@@ -189,6 +189,13 @@ namespace Godot
         public static MainLoop? GetMainLoop() => Tree;
     }
 
+    public static class Dispatcher
+    {
+        // 测试主线程的同步上下文由 Program.Main 设置
+        public static System.Threading.SynchronizationContext? TestContext;
+        public static System.Threading.SynchronizationContext? SynchronizationContext => TestContext;
+    }
+
     public static class OS
     {
         // 测试主线程由 Program.Main 设置

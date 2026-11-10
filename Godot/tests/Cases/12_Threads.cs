@@ -36,6 +36,11 @@ public partial class Mover : Node3D
             bool active = Tx.IsActive;                                               // expect: none
         }, ct);
 
+        await Task.Run(async () =>
+        {
+            await TxTask.SwitchToMainThread();                                       // expect: none
+        }, ct);
+
         Parallel.For(0, 4, i => { var r = Rotation; });                              // expect: VTX013
         new Thread(() => GetParent()).Start();                                       // expect: VTX013
         ThreadPool.QueueUserWorkItem(_ => Tx.Simulate(() => { }));                   // expect: VTX013

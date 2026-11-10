@@ -8,9 +8,9 @@ namespace VTX;
 /// </summary>
 public interface ITxObject
 {
-    /// <summary>校验当前对象的所有 [TxInvariant] 契约，不满足时调用 Tx.Check / Tx.Fail 触发回滚。</summary>
+    /// <summary>校验当前对象的所有 [TxInvariant] 契约；任一返回 false 时整个事务回滚。</summary>
     [Decides]
-    void ValidateTxInvariants();
+    bool ValidateTxInvariants();
 }
 
 /// <summary>
@@ -29,7 +29,7 @@ public sealed class TxFieldAttribute : Attribute
 }
 
 /// <summary>
-/// 标记在 partial class 的无参校验方法上（如 [TxInvariant] private void CheckValid() => Tx.Check(Gold >= 0);）。
+/// 标记在 partial class 的无参、返回 bool 的校验方法上（如 [TxInvariant] private bool CheckValid() => Tx.Require(Gold >= 0, "金币不能为负");）。
 /// 当事务修改了该对象的任何 [TxField] 属性并准备 Commit 时，运行时会自动调用此方法；
 /// 若校验失败，整个事务将自动回滚，防止非法脏状态提交。
 /// </summary>
@@ -76,8 +76,9 @@ public sealed class TxBaselineFieldAttribute : Attribute
 public sealed class TransactsAttribute : Attribute { }
 
 /// <summary>
-/// 标记方法可能失败并触发事务自动回滚（隐含 [Transacts]）。
-/// 在事务之外调用并且失败时，会抛出 <see cref="TxFailedException"/>。
+/// 标记方法可能失败（对应 Verse 的 &lt;decides&gt;，隐含 [Transacts]）。方法必须返回 bool（VTX016）：
+/// 返回 false 表示失败，用 <c>if (!Tx.Require(cond, reason)) return false;</c> / <c>return Tx.Failed(reason);</c> 写；
+/// 调用方必须把失败传播出去（VTX014 / VTX015），最终由 Tx.Try 回滚。需要带回结果时用 out 参数：<c>bool TryFind(out Enemy e)</c>。
 /// </summary>
 [AttributeUsage(AttributeTargets.Method | AttributeTargets.Parameter, Inherited = true)]
 public sealed class DecidesAttribute : Attribute { }

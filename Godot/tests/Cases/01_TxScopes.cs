@@ -13,10 +13,10 @@ public partial class Shop
     public int[] RawArray = new int[4];
 
     [Decides]
-    public void Buy(int price)
+    public bool Buy(int price)
     {
         Gold -= price;                         // expect: none
-        Tx.Check(Gold >= 0, "金币不足");        // expect: none
+        if (!Tx.Require(Gold >= 0, "金币不足")) return false; // expect: none
         Items.Add(price);                       // expect: none
         Plain = 1;                              // expect: VTX001
         Counter++;                              // expect: VTX001
@@ -32,6 +32,7 @@ public partial class Shop
         bool same = ReferenceEquals(Items, Items);         // expect: none
         var span = TimeSpan.FromSeconds(3).TotalSeconds;   // expect: none
         var later = DateTime.Today.AddDays(1);             // expect: VTX007
+        return true;
         static string s0() => "";
     }
 
@@ -45,7 +46,7 @@ public partial class Shop
         Tx.Defer(() => Plain = 2);              // expect: none
         Tx.Try(() => Tx.Defer(() => Plain = 3)); // expect: none
         Tx.Simulate(() => Plain = 4);           // expect: VTX001
-        Tx.WhereCan(new[] { 1 }, p => Plain = p); // expect: VTX001
+        Tx.WhereCan(new[] { 1 }, p => (Plain = p) > 0, new List<int>()); // expect: VTX001
         Tx.FirstOf(new[] { 1 }, p => Buy(p), out _); // expect: none
         Plain = 5;                              // expect: none
         _gold = 1;                              // expect: VTX004

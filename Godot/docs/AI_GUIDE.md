@@ -1,17 +1,19 @@
 # VTX (`using VTX;`) 人类与 AI Agent 编码指南
 
 > **给 AI Agent 的核心提示（TL;DR）**：
-> 本引擎内置了 `VTX` 事务回滚与结构化并发系统，并由 Roslyn 编译器强制执行 **`VTX001` ~ `VTX015` 十五道红线**。完整可编译示例代码见同目录下的 [`Examples.cs`](Examples.cs)。
-> 1. **禁止拆分 `CanExecute()` 与 `Execute()`**：凡涉及多步条件校验与状态修改（如扣费、合成、出牌、吃碰杠、技能结算），统一写成一个标有 `[Decides]` 的方法，在里面直接修改事务状态并用 `Tx.Check(cond, reason)` 校验。
->    - 询问是否可执行（UI 按钮高亮 / AI 推演）：调用 `Tx.Simulate(() => MyAction(), out string? failReason)`（试跑后 100% 自动回滚，失败时拿到原因）。
->    - 真正执行：调用 `Tx.Try(() => MyAction(), out string? failReason)`（全部成功则提交，任一步失败则自动回滚）。
->    - `[Decides]` 方法只能在事务里调用；在普通代码里直接调用且失败时会抛出 `TxFailedException`。
->    - 枚举/搜索多个候选：使用 `Tx.WhereCan(candidates, x => MyAction(x))`（无损筛选所有合法项）或 `Tx.FirstOf(candidates, x => MyAction(x), out var chosen)`（按优先级回溯试探并提交第一个成功项）。
->    - **热路径（每帧大量失败的判断：AI 搜索、落点高亮、批量筛选）用不抛异常的写法**：`[Decides]` 方法返回 `bool`，用 `if (!Tx.Require(cond, reason)) return false;` / `return Tx.Failed(reason);`，调用方写 `if (!X()) return false;` 或 `A() && B()` 把失败一路传播；入口用 `Tx.Try(this, static s => s.X())`、`Tx.Simulate(state, static ...)`、`Tx.WhereCan(cands, c => X(c), resultList)`、`Tx.FirstOf(cands, c => X(c), out var chosen)`。失败约 150 ns、零分配（`Tx.Check` 抛异常约 2.5 µs、200+ B）。
->    - 返回 `bool` 的 `[Decides]` 方法：结果不能丢弃（`VTX014`）；失败后要改做别的事（Verse 的 `A[] or B[]`），先用 `Tx.Try(state, static s => s.A())` 把 A 包成保存点，否则 A 失败前的修改不会回滚（`VTX015`）；不要在事务外调用它（`VTX015`）。
+> 本引擎内置了 `VTX` 事务回滚与结构化并发系统，并由 Roslyn 编译器强制执行 **`VTX001` ~ `VTX016` 十六道红线**。完整可编译示例代码见同目录下的 [`Examples.cs`](Examples.cs)。
+> 1. **禁止拆分 `CanExecute()` 与 `Execute()`**：凡涉及多步条件校验与状态修改（如扣费、合成、出牌、吃碰杠、技能结算），统一写成一个标有 `[Decides]` 的方法，在里面直接修改事务状态。
+>    - **失败 = 返回 `false`，只有这一种写法**：`[Decides]` 方法必须返回 `bool`（`VTX016`）。检查条件写 `if (!Tx.Require(cond, "原因")) return false;`，直接失败写 `return Tx.Failed("原因");`，判空写 `if (target is not { } t) return Tx.Failed("没有目标");`，成功走到最后 `return true;`。需要带回结果时用 out 参数：`bool TryFind(out Enemy enemy)`。
+>    - **失败必须一路传播**：调用别的 `[Decides]` 方法时写 `if (!Other(...)) return false;`，或者 `return A() && B();`。结果不能丢弃、不能先存进变量或当参数传（`VTX014`）；失败后不能接着做别的事（`VTX015`）。要“A 不行就试 B”（Verse 的 `A[] or B[]`），先用保存点包住 A：`if (!Tx.Try(this, static s => s.A())) return B();`——内层 `Tx.Try` 失败只回滚 A 自己。
+>    - **异常只表示 bug**：事务里抛出的异常（越界、空引用、`KeyNotFoundException`……）会先回滚，再原样抛给调用方；不要用异常表达“条件不满足”。
+>    - 询问是否可执行（UI 按钮高亮 / AI 推演）：`Tx.Simulate(() => MyAction(), out string? failReason)`（试跑后 100% 自动回滚，失败时拿到原因）。
+>    - 真正执行：`Tx.Try(() => MyAction(), out string? failReason)`（成功则提交，失败则自动回滚）。热路径用零分配写法：`Tx.Try(this, static s => s.MyAction())`。
+>    - 需要结果：`Tx.Try(this, static (MyType s, out int bonus) => s.TryRoll(20, out bonus), out int bonus)`（`Tx.Simulate` 同理，可以预览结果）。
+>    - `[Decides]` 方法只能在事务里调用（`Tx.Try` / `Tx.Simulate` / `Tx.FirstOf` / `Tx.WhereCan` 的 lambda 里，或另一个 `[Decides]` 方法里，否则 `VTX015`）。
+>    - 枚举/搜索多个候选：`Tx.WhereCan(candidates, x => MyAction(x), resultList)`（无损筛选所有合法项，结果追加进 `resultList`）或 `Tx.FirstOf(candidates, x => MyAction(x), out var chosen)`（按优先级回溯试探并提交第一个成功项）。
 > 2. **事务状态、不变量與持久化声明规则**：
 >    - 标量/结构体/引用字段：在 `partial class` 中写 `[TxField] private int _gold;`，编译器会自动生成公开属性 `Gold`、快照 `CaptureTxSnapshot()` / `RestoreTxSnapshot(snap)`、状态对比 `DiffTxState(before)` 以及 JSON 序列化 `ToTxJson()` / `FromTxJson(json)`。读写时**必须使用生成的公开属性 `Gold`**（禁止直接写 `_gold`，否则触发 `VTX004`）。
->    - 类不变量（守恒律/上下限契约）：在方法上贴 `[TxInvariant]`（如 `[TxInvariant] private void CheckValid() => Tx.Check(Mana <= MaxMana);`），事务 Commit 前会自动调用校验，不满足则自动回滚整个事务。
+>    - 类不变量（守恒律/上下限契约）：在返回 `bool` 的无参方法上贴 `[TxInvariant]`（如 `[TxInvariant] private bool CheckValid() => Tx.Require(Mana <= MaxMana, "法力超上限");`，多条用 `&&` 连起来），事务 Commit 前会自动调用校验，返回 `false` 则回滚整个事务。
 >    - 跨版本存档兼容：在类上贴 `[TxPersistable]` 与 `[TxBaselineField("Gold", "int")]`（或维护项目根目录 `vtx.schema.txt`），若后续删除或篡改已持久化字段类型将触发 `VTX009` 编译报错。
 >    - 容器字段：**严禁对 `T[]`、`List<T>`、`Dictionary<K,V>` 贴 `[TxField]`（触发 `VTX006`）**。请直接声明只读属性：`public TxList<Item> Items { [Pure] get; } = new();`、`TxArray<T>` 或 `TxDict<K,V>`。
 > 3. **`[Pure]` 与委托规则**：
@@ -29,7 +31,7 @@
 >    - 协程手里有 `ct` 就一路传下去（否则 `VTX005`）；协程属于某个节点时用 `TxTask.LifetimeOf(this)` 作为令牌，节点 `QueueFree` / 被释放时协程自动取消。
 >    - 不等待的 `[Suspends]` 调用必须写 `.Forget()`（异常会通过 `GD.PushError` 报告），`[Suspends]` 方法不能是 `async void`（`VTX012`）。
 >    - 排查协程泄漏：`TxTask.TrackStackTraces = true;` 然后看 `TxTask.GetActiveWaits()`。
-> 6. **线程规则**：`Tx`、`TxTask`、`TxGodot`、`[TxField]` 状态和场景树节点都只属于主线程（运行时会抛异常，编译期 `VTX013`）。后台线程（`Task.Run` / `Parallel` / `WorkerThreadPool`）只算拷贝出来的纯数据，`await` 之后自动回到主线程再写回；在后台线程对只属于该线程的数据做事务推演时，先写 `using var scope = Tx.EnterWorkerScope();`（作用域内仍然不能碰 Godot 对象）。不要写 `ConfigureAwait(false)`。
+> 6. **线程规则**：`Tx`、`TxTask`、`TxGodot`、`[TxField]` 状态和场景树节点都只属于主线程（运行时会抛异常，编译期 `VTX013`）。后台线程（`Task.Run` / `Parallel` / `WorkerThreadPool`）只算拷贝出来的纯数据，在主线程上 `await` 它之后自动回到主线程再写回；已经身处后台线程时用 `await TxTask.SwitchToMainThread();` 回到主线程；在后台线程对只属于该线程的数据做事务推演时，先写 `using var scope = Tx.EnterWorkerScope();`（作用域内仍然不能碰 Godot 对象）。不要写 `ConfigureAwait(false)`。
 
 ---
 
@@ -66,7 +68,8 @@
 - **`WaitSignal` 的信号源被释放**时任务以 `ObjectDisposedException` 结束（原生 `ToSignal` 会永远挂起）。
 - **`Rush` 的后台分支**只受 `parentCt` 控制，建议传入 `scope.Token`；后台分支的异常通过 `GD.PushError` 报告。
 - **`TxRandom` + `Simulate` 可以“预知”随机结果**：例如在 `WhereCan` 里调用 `CheckChance`，返回的就是“这次会命中”的候选。若不希望玩家/AI 预知，请不要在可预览的逻辑里掷骰。
-- **两种失败的语义一样，只是传播方式不同**：`Tx.Check` / `Tx.Fail` 立即跳出到最近的 `Tx.Try`；`Tx.Require` / `Tx.Failed` 只返回 `false`，要靠调用方一路 `return false`。在事务内部，`Tx.Try(...)` 就是一个保存点：内层失败只回滚内层。
+- **失败靠返回值传播**：`Tx.Require` / `Tx.Failed` 只记录原因并返回 `false`，要靠调用方一路 `return false` 传到 `Tx.Try`，在那里回滚。事务内部的 `Tx.Try(...)` 就是一个保存点：内层失败只回滚内层。失败一次约 80 ns、零分配。
+- **Tx 容器越界、`TxDict` 缺键是 bug**，抛标准异常（事务内先回滚）；可能越界 / 缺键时用 `TryGetAt` / `TryGetValue`。
 - **线程**：事务状态（Undo Log）按线程隔离；`Tx.EnterWorkerScope()` 只是声明“这些数据只属于当前线程”，VTX 不会替你加锁。
 - **未覆盖（编译器不检查）**：属性 getter / 用户定义运算符 / 构造函数内部的副作用。请保持它们无副作用。
 
@@ -90,6 +93,7 @@
 | **`VTX010`** | `[Pure]` 方法 / 属性 / lambda 有副作用：修改了非局部状态、调用了非 `[Pure]` 方法或 `[Transacts]` 方法 | 去掉副作用；若需要“试跑”事务逻辑，用 `Tx.Simulate(() => ...)`；若方法本来就会修改状态，把 `[Pure]` 换成 `[Transacts]`。 |
 | **`VTX012`** | `[Suspends]` 方法返回的任务被丢弃（单独一句调用或 `_ = ...`），或 `[Suspends]` 方法写成了 `async void` | `await` 它；确实要“发出去不管”就写 `.Forget()`；`async void` 改成返回 `Task`。 |
 | **`VTX013`** | 在后台线程的 lambda（`Task.Run`、`Task.Factory.StartNew`、`Parallel.*`、`ThreadPool.QueueUserWorkItem`、`new Thread(...)`、`WorkerThreadPool.AddTask`）里使用了 `Tx`、`TxTask`、`TxGodot`、`[TxField]` 属性或场景树节点的成员（lambda 里新建的局部对象、`CallDeferred` 等线程安全的投递除外） | 在主线程把需要的数据拷贝成局部变量再传进去，算完 `await` 回主线程再写入；写回节点也可以用 `CallDeferred` / `Callable.From(...).CallDeferred()`；对线程私有数据做事务推演时在 lambda 开头写 `using var scope = Tx.EnterWorkerScope();`。 |
-| **`VTX014`** | 返回 `bool` 的 `[Decides]` 方法（含 `Tx.Require` / `Tx.Failed`）的结果被丢弃：单独一句调用或 `_ = ...` | `if (!X(...)) return false;` 让失败传播；只想检查条件并立即中断就改用 `Tx.Check(...)`。 |
-| **`VTX015`**（警告） | 返回 `bool` 的 `[Decides]` 方法失败后没有传播失败而是继续执行（`if` 的 false 分支不是 `return false` / `Tx.Fail` / `throw`、`A() \|\| B()`、`?:`），或在事务之外调用它 | 直接 `return false` 传播；要“A 不行就 B”时写 `if (!Tx.Try(this, static s => s.A())) B();`（内层 Try 是保存点）；在 `Tx.Try(...)` 里调用。 |
-| **`VTX011`** | `[TxField]` / `[TxInvariant]` 用在了不支持的地方：struct、static / readonly 字段、非 partial 类型（含外层类型）、生成的属性名冲突或不合法、`[TxInvariant]` 方法带参数或有返回值 | 改为 `partial class`；字段改成实例、非 readonly；用 `[TxField("Name")]` 指定不冲突的属性名；`[TxInvariant]` 写成无参数 `void` 方法。 |
+| **`VTX014`** | `[Decides]` 方法（含 `Tx.Require` / `Tx.Failed`）的结果被丢弃（单独一句调用、`_ = ...`、放在 `Action` lambda 里），或没有直接使用（存进变量、当参数传） | 直接写在 `if` / `return` / `&&` 里：`if (!X(...)) return false;`、`return A() && B();`。 |
+| **`VTX015`** | `[Decides]` 方法失败后没有传播失败而是继续执行（`if` 的失败分支不是 `return false` / `return Tx.Failed(...)` / `throw`、`A() \|\| B()`、`!A() && ...`、失败时返回了 `true`），或在事务之外调用它 | 失败就 `return false`；要“A 不行就 B”写 `if (!Tx.Try(this, static s => s.A())) return B();`（内层 Try 是保存点）；在 `Tx.Try(...)` / `Tx.Simulate(...)` 里调用。 |
+| **`VTX016`** | `[Decides]` 方法（含 override / 接口实现）不返回 `bool` | 改成返回 `bool`：失败 `return false` / `return Tx.Failed(...)`，成功 `return true`；需要结果用 `out` 参数。 |
+| **`VTX011`** | `[TxField]` / `[TxInvariant]` 用在了不支持的地方：struct、static / readonly 字段、非 partial 类型（含外层类型）、生成的属性名冲突或不合法、`[TxInvariant]` 方法带参数或不返回 `bool` | 改为 `partial class`；字段改成实例、非 readonly；用 `[TxField("Name")]` 指定不冲突的属性名；`[TxInvariant]` 写成无参数、返回 `bool` 的方法。 |

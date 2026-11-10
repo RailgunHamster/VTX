@@ -9,21 +9,16 @@ namespace VTX;
 /// <summary>
 /// VTX 单线程内存事务运行时：
 /// 1. Savepoint 嵌套栈 + 零闭包对象池 Undo Log；
-/// 2. [CallerArgumentExpression] 自动失败原因捕获（LastFailReason）；
-/// 3. FirstOf / WhereCan 多候选回溯搜索；
-/// 4. [TxInvariant] 提交前类不变量契约自动校验。
-/// 5. 两种失败方式：Tx.Check / Tx.Fail 用内部异常立即中断（写起来最短）；
-///    返回 bool 的 [Decides] 方法用 Tx.Require / Tx.Failed 返回 false（不抛异常，约快 30 倍，适合热路径）。
+/// 2. 失败 = 返回 false：[Decides] 方法一律返回 bool，用 Tx.Require / Tx.Failed 记录原因并返回 false，
+///    调用方 `if (!X()) return false;` 一路传播到 Tx.Try，那里回滚整个事务。失败路径不抛异常、不分配内存。
+///    异常只表示 bug：事务里抛出的任何异常都会先回滚，再原样抛给调用方。
+/// 3. [CallerArgumentExpression] 自动失败原因捕获（LastFailReason）；
+/// 4. FirstOf / WhereCan 多候选回溯搜索；
+/// 5. [TxInvariant] 提交前类不变量契约自动校验（返回 false 即回滚）；
 /// 6. 只能在主线程使用；后台线程推演独立数据时用 <see cref="EnterWorkerScope"/>。
 /// </summary>
 public static class Tx
 {
-    private sealed class TxFailSignal : Exception
-    {
-        public static readonly TxFailSignal Instance = new();
-        private TxFailSignal() : base("VTX transaction failed.") { }
-    }
-
     internal interface IUndoStep
     {
         void UndoAndRecycle();
@@ -119,8 +114,6 @@ public static class Tx
         None,
         Message,
         Condition,
-        NotNullRef,
-        NotNullValue,
         BodyReturnedFalse,
     }
 
@@ -149,7 +142,7 @@ public static class Tx
     }
 
     /// <summary>
-    /// 最近一次事务失败的原因描述或触发失败的源码条件表达式（由 Tx.Check / Tx.Fail 自动记录）。
+    /// 最近一次事务失败的原因描述或触发失败的源码条件表达式（由 Tx.Require / Tx.Failed 自动记录）。
     /// </summary>
     public static string? LastFailReason
     {
@@ -169,8 +162,6 @@ public static class Tx
     {
         FailKind.Message => reason,
         FailKind.Condition => string.IsNullOrEmpty(reason) ? expr : $"{reason} ({expr})",
-        FailKind.NotNullRef => string.IsNullOrEmpty(reason) ? $"{expr} is not null" : $"{reason} ({expr} is not null)",
-        FailKind.NotNullValue => string.IsNullOrEmpty(reason) ? $"{expr}.HasValue" : $"{reason} ({expr}.HasValue)",
         FailKind.BodyReturnedFalse => "Transaction body returned false",
         _ => null,
     };
@@ -198,21 +189,18 @@ public static class Tx
         }
     }
 
+    private struct StateResultBody<TState, TResult> : IBody
+    {
+        public TxFunc<TState, TResult> Func;
+        public TState State;
+        public TResult Result;
+        public bool Invoke() => Func(State, out Result);
+    }
+
     private struct PredicateBody : IBody
     {
         public Func<bool> Func;
         public bool Invoke() => Func();
-    }
-
-    private struct ResultBody<TResult> : IBody
-    {
-        public Func<TResult> Func;
-        public TResult Result;
-        public bool Invoke()
-        {
-            Result = Func();
-            return true;
-        }
     }
 
     private struct StatePredicateBody<TState> : IBody
@@ -220,17 +208,6 @@ public static class Tx
         public Func<TState, bool> Func;
         public TState State;
         public bool Invoke() => Func(State);
-    }
-
-    private struct CandidateActionBody<T> : IBody
-    {
-        public Action<T> Action;
-        public T Candidate;
-        public bool Invoke()
-        {
-            Action(Candidate);
-            return true;
-        }
     }
 
     private static bool Run<TBody>(ref TBody body, bool simulate) where TBody : struct, IBody
@@ -269,22 +246,15 @@ public static class Tx
         bool ok;
         try
         {
-            ok = body.Invoke();
-            if (ok)
-            {
-                ValidateTouchedInvariants(touched, touchedSavepoint);
-            }
-            else if (_failSeq == failSeqAtEntry)
+            ok = body.Invoke() && ValidateTouchedInvariants(touched, touchedSavepoint);
+            if (!ok && _failSeq == failSeqAtEntry)
             {
                 SetFail(FailKind.BodyReturnedFalse, null, null);
             }
         }
-        catch (TxFailSignal)
-        {
-            ok = false;
-        }
         catch
         {
+            // 异常 = bug（不是失败）：先回滚，再把异常原样抛给调用方
             _depth = entryDepth;
             RollbackToSavepoint(undoLog, deferred, touched, undoSavepoint, deferSavepoint, touchedSavepoint);
             throw;
@@ -306,8 +276,8 @@ public static class Tx
     }
 
     /// <summary>
-    /// 执行可回滚事务块。若内部调用 Tx.Check(false) 或 Tx.Fail()，或提交前违反 [TxInvariant]，
-    /// 所有已发生的修改按逆序自动回滚并返回 false。支持任意层级嵌套。
+    /// 执行一段不会失败的可回滚修改：只有提交前违反 [TxInvariant] 时回滚并返回 false；抛出异常时回滚并重新抛出。
+    /// 会失败的逻辑写成返回 bool 的 [Decides] 方法，用 Try(Func&lt;bool&gt;) 或 Try(state, static ...) 调用。
     /// 最外层提交后才执行 Tx.Defer 登记的动作；若这些动作抛出异常，事务仍然已经提交，
     /// 异常会在全部延迟动作执行完毕后从 Try 抛出（多个时为 AggregateException）。
     /// </summary>
@@ -328,7 +298,8 @@ public static class Tx
     }
 
     /// <summary>
-    /// 执行返回布尔值的可回滚事务块（无异常快速路径：返回 false 或调用 Tx.Fail() 均会自动回滚）。
+    /// 执行可回滚事务块：body 返回 false（或提交前违反 [TxInvariant]）时，所有修改按逆序回滚并返回 false。支持任意层级嵌套；
+    /// 嵌套在另一个事务里时就是一个保存点：失败只回滚这一段。
     /// 失败原因可以从 <see cref="LastFailReason"/> 读取（需要 out 参数时用 Try(state, body, out reason)）。
     /// </summary>
     [Transacts]
@@ -337,6 +308,32 @@ public static class Tx
         ArgumentNullException.ThrowIfNull(body);
         var b = new PredicateBody { Func = body };
         return Run(ref b, simulate: false);
+    }
+
+    /// <summary>执行返回布尔值的可回滚事务块，并在失败时输出原因。</summary>
+    [Transacts]
+    public static bool Try([Transacts] Func<bool> body, out string? failReason)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        var b = new PredicateBody { Func = body };
+        bool ok = Run(ref b, simulate: false);
+        failReason = ok ? null : LastFailReason;
+        return ok;
+    }
+
+    /// <summary>
+    /// 带结果的事务：body 是一个返回 bool、通过 out 带回结果的委托（通常直接转发给 bool TryX(..., out T result) 的 [Decides] 方法）。
+    /// 成功提交时 result 为 body 给出的值；失败时为 default。lambda 带 out 参数时需要写出参数类型：
+    /// <code>Tx.Try(this, static (Forge s, out int bonus) => s.TryRoll(20, out bonus), out int bonus)</code>
+    /// </summary>
+    [Transacts]
+    public static bool Try<TState, TResult>(TState state, [Transacts] TxFunc<TState, TResult> body, [MaybeNullWhen(false)] out TResult result)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        var b = new StateResultBody<TState, TResult> { Func = body, State = state };
+        bool ok = Run(ref b, simulate: false);
+        result = ok ? b.Result : default;
+        return ok;
     }
 
     /// <summary>
@@ -365,20 +362,6 @@ public static class Tx
     }
 
     /// <summary>
-    /// 带返回值的可回滚事务块：若成功通过所有校验并提交，将返回值赋给 result 并返回 true；
-    /// 若中途失败回滚，result 置为 default 并返回 false（避免在事务内直接修改外部局部变量触发 VTX001）。
-    /// </summary>
-    [Transacts]
-    public static bool Try<TResult>([Transacts] Func<TResult> body, [MaybeNullWhen(false)] out TResult result)
-    {
-        ArgumentNullException.ThrowIfNull(body);
-        var b = new ResultBody<TResult> { Func = body };
-        bool ok = Run(ref b, simulate: false);
-        result = ok ? b.Result : default;
-        return ok;
-    }
-
-    /// <summary>
     /// Dry-Run 沙盒推演：在真实状态上试跑 body（含 [TxInvariant] 校验），随后强制 100% 回滚所有状态与延迟副作用。
     /// 适用于 UI CanExecute 判定、AI 出牌/走位前向推演、以及 aidbg 在线无损探测。
     /// 注意：只有经过 Undo Log 的状态（[TxField]、Tx 容器、TxRandom、TxGodot）会被回滚。
@@ -399,14 +382,30 @@ public static class Tx
         return ok;
     }
 
-    /// <summary>
-    /// 带返回值的 Dry-Run 沙盒推演：在真实状态上试跑计算并提取返回值，随后强制 100% 回滚所有状态变化。
-    /// </summary>
+    /// <summary>Dry-Run：试跑返回 bool 的事务块后 100% 回滚。body 返回 false 即判定失败。</summary>
     [Pure]
-    public static bool Simulate<TResult>([Transacts] Func<TResult> body, [MaybeNullWhen(false)] out TResult result)
+    public static bool Simulate([Transacts] Func<bool> body) => Simulate(body, out _);
+
+    /// <summary>Dry-Run：试跑返回 bool 的事务块后 100% 回滚，并在失败时输出原因（适合 UI 禁用提示）。</summary>
+    [Pure]
+    public static bool Simulate([Transacts] Func<bool> body, out string? failReason)
     {
         ArgumentNullException.ThrowIfNull(body);
-        var b = new ResultBody<TResult> { Func = body };
+        var b = new PredicateBody { Func = body };
+        bool ok = Run(ref b, simulate: true);
+        failReason = ok ? null : LastFailReason;
+        return ok;
+    }
+
+    /// <summary>
+    /// 带结果的 Dry-Run：试跑后 100% 回滚，但把 body 给出的结果带出来（例如预览这次强化会掷出多少点）。
+    /// <code>Tx.Simulate(this, static (Forge s, out int bonus) => s.TryRoll(20, out bonus), out int preview)</code>
+    /// </summary>
+    [Pure]
+    public static bool Simulate<TState, TResult>(TState state, [Transacts] TxFunc<TState, TResult> body, [MaybeNullWhen(false)] out TResult result)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        var b = new StateResultBody<TState, TResult> { Func = body, State = state };
         bool ok = Run(ref b, simulate: true);
         result = ok ? b.Result : default;
         return ok;
@@ -433,37 +432,8 @@ public static class Tx
     }
 
     /// <summary>
-    /// 多候选回溯执行（对应 Verse 的 Choice 选择器）：
-    /// 按顺序对 candidates 中的每个候选尝试执行 action(candidate)；
-    /// 若某个候选失败则自动回滚其产生的副作用并尝试下一个；
-    /// 第一个成功的候选直接提交保留其修改，并通过 chosen 返回该候选。
-    /// </summary>
-    [Transacts]
-    public static bool FirstOf<T>(
-        IEnumerable<T> candidates,
-        [Transacts] Action<T> action,
-        [MaybeNullWhen(false)] out T chosen)
-    {
-        ArgumentNullException.ThrowIfNull(candidates);
-        ArgumentNullException.ThrowIfNull(action);
-
-        foreach (T candidate in candidates)
-        {
-            var b = new CandidateActionBody<T> { Action = action, Candidate = candidate };
-            if (Run(ref b, simulate: false))
-            {
-                chosen = candidate;
-                return true;
-            }
-        }
-
-        chosen = default;
-        return false;
-    }
-
-    /// <summary>
-    /// FirstOf 的不抛异常版本：action 返回 false 表示这个候选失败（回滚它的修改，试下一个）。
-    /// 用 static lambda 时整个搜索不为闭包分配内存。
+    /// 多候选回溯执行（对应 Verse 的 Choice 选择器）：按顺序对每个候选执行 action(candidate)；
+    /// 返回 false 的候选回滚它的修改并尝试下一个，第一个返回 true 的候选提交并通过 chosen 返回。
     /// </summary>
     [Transacts]
     public static bool FirstOf<T>(
@@ -489,31 +459,9 @@ public static class Tx
     }
 
     /// <summary>
-    /// 多候选无损筛选（基于 Simulate）：
-    /// 在真实状态上依次试跑每个 candidate，每次试跑后 100% 回滚状态，返回所有能成功通过事务与不变量校验的合法候选列表。
-    /// 非常适合战棋合法落点高亮、麻将可打出牌筛选、卡牌可用目标枚举。
-    /// </summary>
-    [Pure]
-    public static List<T> WhereCan<T>(IEnumerable<T> candidates, [Transacts] Action<T> action)
-    {
-        ArgumentNullException.ThrowIfNull(candidates);
-        ArgumentNullException.ThrowIfNull(action);
-
-        var validList = new List<T>();
-        foreach (T candidate in candidates)
-        {
-            var b = new CandidateActionBody<T> { Action = action, Candidate = candidate };
-            if (Run(ref b, simulate: true))
-            {
-                validList.Add(candidate);
-            }
-        }
-        return validList;
-    }
-
-    /// <summary>
-    /// WhereCan 的不抛异常、可复用结果列表版本：action 返回 false 表示这个候选不合法。
-    /// 合法候选追加到 results（不会先清空），返回追加的个数。适合每帧大量枚举（AI 搜索、落点高亮）。
+    /// 多候选无损筛选（基于 Simulate）：在真实状态上依次试跑每个候选，每次试跑后 100% 回滚；
+    /// action 返回 true（且通过 [TxInvariant]）的合法候选追加到 results（不会先清空），返回追加的个数。
+    /// 适合战棋合法落点高亮、麻将可打出牌筛选、AI 搜索。
     /// </summary>
     [Pure]
     public static int WhereCan<T>(IEnumerable<T> candidates, [Transacts] Func<T, bool> action, List<T> results)
@@ -536,33 +484,9 @@ public static class Tx
     }
 
     /// <summary>
-    /// 条件断言：若 condition 为 false，自动记录失败原因（或条件源码表达式）并立即中断回滚当前事务。
-    /// </summary>
-    [Decides]
-    public static void Check(
-        [DoesNotReturnIf(false)] bool condition,
-        string? reason = null,
-        [CallerArgumentExpression(nameof(condition))] string? expr = null)
-    {
-        if (!condition)
-        {
-            FailCore(FailKind.Condition, reason, expr);
-        }
-    }
-
-    /// <summary>
-    /// 立即触发当前事务失败并回滚，可附带失败原因说明。
-    /// </summary>
-    [Decides, DoesNotReturn]
-    public static void Fail(string? reason = null)
-    {
-        FailCore(FailKind.Message, reason ?? "Tx.Fail()", null);
-    }
-
-    /// <summary>
-    /// 不抛异常的条件检查：条件成立返回 true；不成立时记录失败原因（或条件源码表达式）并返回 false。
-    /// 用在返回 bool 的 [Decides] 方法里：<c>if (!Tx.Require(Gold >= price, "金币不足")) return false;</c>
-    /// 失败要靠返回值一路传播到 Tx.Try(Func&lt;bool&gt;)，那里会回滚整个事务。
+    /// 条件检查：条件成立返回 true；不成立时记录失败原因（或条件源码表达式）并返回 false。
+    /// <c>if (!Tx.Require(Gold >= price, "金币不足")) return false;</c>
+    /// 失败靠返回值一路传播到 Tx.Try，那里会回滚整个事务。
     /// </summary>
     [Decides]
     public static bool Require(
@@ -577,79 +501,13 @@ public static class Tx
     }
 
     /// <summary>
-    /// 不抛异常的失败：记录原因并返回 false。用法：<c>if (target is null) return Tx.Failed("没有目标");</c>
+    /// 失败：记录原因并返回 false。用法：<c>if (target is not { } t) return Tx.Failed("没有目标");</c>
     /// </summary>
     [Decides]
     public static bool Failed(string? reason = null)
     {
         SetFail(FailKind.Message, reason ?? "Tx.Failed()", null);
         return false;
-    }
-
-    /// <summary>
-    /// 失败的统一出口：事务内抛出内部回滚信号（由 Try/Simulate 捕获）；
-    /// 事务外（例如在普通代码里直接调用了 [Decides] 方法）抛出公开的 <see cref="TxFailedException"/>，
-    /// 而不是让内部信号类型泄漏给调用方。
-    /// </summary>
-    [DoesNotReturn]
-    private static void FailCore(FailKind kind, string? reason, string? expr)
-    {
-        SetFail(kind, reason, expr);
-        if (_depth > 0)
-        {
-            throw TxFailSignal.Instance;
-        }
-        throw new TxFailedException(LastFailReason);
-    }
-
-    /// <summary>
-    /// 供事务容器使用：事务内按 Verse 语义失败回滚；事务外抛出与 BCL 容器一致的标准异常。
-    /// </summary>
-    [DoesNotReturn]
-    internal static void FailOrThrow(string reason, Exception outsideTransaction)
-    {
-        if (_depth > 0)
-        {
-            SetFail(FailKind.Message, reason, null);
-            throw TxFailSignal.Instance;
-        }
-        throw outsideTransaction;
-    }
-
-    /// <summary>
-    /// 可空引用解包断言（对应 Verse 的 ?Option 解包）：
-    /// 若 value 为 null 则记录失败表达式并立即中断回滚当前事务；否则返回非空值。
-    /// </summary>
-    [Decides]
-    [return: NotNull]
-    public static T NotNull<T>(
-        [NotNull] T? value,
-        string? reason = null,
-        [CallerArgumentExpression(nameof(value))] string? expr = null)
-        where T : class
-    {
-        if (value is null)
-        {
-            FailCore(FailKind.NotNullRef, reason, expr);
-        }
-        return value;
-    }
-
-    /// <summary>
-    /// 可空值类型解包断言：若 value.HasValue 为 false 则立即中断回滚当前事务；否则返回其 Value。
-    /// </summary>
-    [Decides]
-    public static T NotNull<T>(
-        [NotNull] T? value,
-        string? reason = null,
-        [CallerArgumentExpression(nameof(value))] string? expr = null)
-        where T : struct
-    {
-        if (!value.HasValue)
-        {
-            FailCore(FailKind.NotNullValue, reason, expr);
-        }
-        return value.Value;
     }
 
     /// <summary>
@@ -771,13 +629,20 @@ public static class Tx
         }
     }
 
-    private static void ValidateTouchedInvariants(List<ITxObject> touched, int touchedSavepoint)
+    private static bool ValidateTouchedInvariants(List<ITxObject> touched, int touchedSavepoint)
     {
         // 校验过程中可能继续 Touch 新对象（例如不变量方法读取了其它事务对象），按索引遍历即可覆盖新增项。
         for (int i = touchedSavepoint; i < touched.Count; i++)
         {
-            touched[i].ValidateTxInvariants();
+            int seq = _failSeq;
+            if (!touched[i].ValidateTxInvariants())
+            {
+                if (_failSeq == seq)
+                    SetFail(FailKind.Message, "[TxInvariant] 校验未通过: " + touched[i].GetType().Name, null);
+                return false;
+            }
         }
+        return true;
     }
 
     private static void RollbackToSavepoint(
@@ -877,19 +742,9 @@ public static class Tx
 }
 
 /// <summary>
-/// 在事务之外调用了 Tx.Check / Tx.Fail / Tx.NotNull（或调用了内部使用它们的 [Decides] 方法）且条件不成立时抛出。
-/// [Decides] 方法应当在 Tx.Try / Tx.Simulate / Tx.FirstOf / Tx.WhereCan 或另一个事务方法内部调用。
+/// 带结果的事务体：返回 false 表示失败，成功时通过 out 给出结果。见 <see cref="Tx.Try{TState, TResult}"/>。
 /// </summary>
-public sealed class TxFailedException : InvalidOperationException
-{
-    public string? Reason { get; }
-
-    public TxFailedException(string? reason)
-        : base($"VTX: 在事务之外发生了失败（{reason ?? "未提供原因"}）。[Decides] 方法应在 Tx.Try / Tx.Simulate 内调用。")
-    {
-        Reason = reason;
-    }
-}
+public delegate bool TxFunc<in TState, TResult>(TState state, out TResult result);
 
 /// <summary>
 /// 回滚过程中有 Undo 步骤自身抛出了异常。其余步骤仍已尽量恢复；状态可能不完整。

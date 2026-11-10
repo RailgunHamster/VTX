@@ -122,7 +122,7 @@ namespace Godot.SourceGenerators
 
         public static readonly DiagnosticDescriptor RuleDiscardedDecides = new DiagnosticDescriptor(
             id: "VTX014",
-            title: "返回 bool 的 [Decides] 方法的结果被丢弃，失败会被忽略",
+            title: "返回 bool 的 [Decides] 方法的结果被丢弃或没有直接使用，失败会被忽略",
             messageFormat: "{0}",
             category: "VTX",
             defaultSeverity: DiagnosticSeverity.Error,
@@ -133,7 +133,15 @@ namespace Godot.SourceGenerators
             title: "返回 bool 的 [Decides] 方法失败后，它已做的修改不会回滚",
             messageFormat: "{0}",
             category: "VTX",
-            defaultSeverity: DiagnosticSeverity.Warning,
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        public static readonly DiagnosticDescriptor RuleDecidesSignature = new DiagnosticDescriptor(
+            id: "VTX016",
+            title: "[Decides] 方法必须返回 bool",
+            messageFormat: "[Decides] 方法 '{0}' 必须返回 bool：返回 false 表示失败（用 Tx.Require / Tx.Failed）；需要带回结果时用 out 参数，例如 bool TryFind(out Enemy enemy)",
+            category: "VTX",
+            defaultSeverity: DiagnosticSeverity.Error,
             isEnabledByDefault: true);
 
         public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics =>
@@ -151,7 +159,8 @@ namespace Godot.SourceGenerators
                 RuleDiscardedSuspends,
                 RuleBackgroundThread,
                 RuleDiscardedDecides,
-                RuleUnrolledFailure);
+                RuleUnrolledFailure,
+                RuleDecidesSignature);
 
         public override void Initialize(AnalysisContext context)
         {
@@ -190,6 +199,7 @@ namespace Godot.SourceGenerators
             context.RegisterSyntaxNodeAction(AnalyzeMemberAccess, SyntaxKind.SimpleMemberAccessExpression);
             context.RegisterSyntaxNodeAction(AnalyzeAwait, SyntaxKind.AwaitExpression);
             context.RegisterSyntaxNodeAction(AnalyzeBackgroundName, SyntaxKind.IdentifierName, SyntaxKind.GenericName);
+            context.RegisterSymbolAction(AnalyzeDecidesSignature, SymbolKind.Method);
             context.RegisterSyntaxNodeAction(AnalyzeAsyncVoid,
                 SyntaxKind.MethodDeclaration,
                 SyntaxKind.LocalFunctionStatement,
@@ -1443,72 +1453,118 @@ namespace Godot.SourceGenerators
         // VTX014 / VTX015：不抛异常的失败（返回 bool 的 [Decides] 方法）
         // =====================================================================
 
+        private enum DecidesUse
+        {
+            Propagated,
+            Fallback,
+            Discarded,
+            Indirect,
+        }
+
         private static void CheckBoolDecides(SyntaxNodeAnalysisContext context, InvocationExpressionSyntax invocation, IMethodSymbol method)
         {
             var model = context.SemanticModel;
             var ct = context.CancellationToken;
+            // VTX 运行时自己内部的调用（例如提交前调用 ITxObject.ValidateTxInvariants）不检查
+            if (IsTrustedRuntimeType(model.GetEnclosingSymbol(invocation.SpanStart, ct)?.ContainingType))
+                return;
             bool trusted = IsTrustedRuntimeType(method.ContainingType);
             string name = $"{method.ContainingType?.Name}.{method.Name}";
 
-            if (IsDiscarded(invocation))
+            switch (ClassifyDecidesUse(model, invocation, ct))
             {
-                string msg = trusted
-                    ? $"'{name}' 的返回值被丢弃了：返回 false 时什么也不会发生，事务照常提交。写成 if (!{name}(...)) return false; 让失败传播，或改用会直接中断的 Tx.Check / Tx.Fail"
-                    : $"'{name}' 返回 false 表示失败，结果不能丢弃：写成 if (!{method.Name}(...)) return false; 让失败一路传播到 Tx.Try，或用 Tx.Try(state, static s => ...) 把它包成一个能单独回滚的保存点";
-                context.ReportDiagnostic(Diagnostic.Create(RuleDiscardedDecides, invocation.GetLocation(), msg));
-                return;
+                case DecidesUse.Discarded:
+                    context.ReportDiagnostic(Diagnostic.Create(RuleDiscardedDecides, invocation.GetLocation(),
+                        $"'{name}' 返回 false 表示失败，结果不能丢弃：写成 if (!{method.Name}(...)) return false; 让失败一路传播到 Tx.Try"));
+                    return;
+                case DecidesUse.Indirect:
+                    context.ReportDiagnostic(Diagnostic.Create(RuleDiscardedDecides, invocation.GetLocation(),
+                        $"'{name}' 的结果要直接用在 if / return / && 里（例如 if (!{method.Name}(...)) return false;），不要先存进变量或当参数传，否则无法确认失败被传播了"));
+                    return;
+                case DecidesUse.Fallback:
+                    // Tx.Require / Tx.Failed / CheckChance 这类自己不改状态的检查，失败后做别的事是安全的
+                    if (!trusted)
+                    {
+                        context.ReportDiagnostic(Diagnostic.Create(RuleUnrolledFailure, invocation.GetLocation(),
+                            $"'{name}' 失败后这里没有传播失败（return false / return Tx.Failed / throw），而是继续执行了别的逻辑，它失败前做的修改不会回滚。" +
+                            $"要“A 不行就 B”，先用保存点包住 A：if (!Tx.Try(this, static s => s.{method.Name}(...))) ..."));
+                        return;
+                    }
+                    break;
             }
 
-            // Tx.Require / Tx.Failed 自己不改任何状态，失败后做别的事是安全的
-            if (trusted)
-                return;
-
-            if (FindScope(model, invocation, ct) == null)
+            if (!trusted && FindScope(model, invocation, ct) == null)
             {
                 context.ReportDiagnostic(Diagnostic.Create(RuleUnrolledFailure, invocation.GetLocation(),
-                    $"在事务之外调用了 '{name}'：它返回 false 时，已经做的修改不会回滚（事务外没有 Undo Log）。请在 Tx.Try(...) 里调用它"));
-                return;
-            }
-
-            if (IsUnsafeFallback(model, invocation, ct))
-            {
-                context.ReportDiagnostic(Diagnostic.Create(RuleUnrolledFailure, invocation.GetLocation(),
-                    $"'{name}' 失败后这里继续执行了别的逻辑，但它失败前做的修改还留着。" +
-                    $"要么直接 return false / Tx.Fail 传播失败，要么用 Tx.Try(state, static s => s.{method.Name}(...)) 把它包成保存点（对应 Verse 的 A[] or B[]）"));
+                    $"在事务之外调用了 '{name}'：它返回 false 时，已经做的修改不会回滚（事务外没有 Undo Log）。请在 Tx.Try(...) / Tx.Simulate(...) 里调用，或把调用方也标成 [Decides]"));
             }
         }
 
-        /// <summary>调用结果为 false 时，代码没有传播失败而是继续执行（if 的 false 分支、||、?: 的 false 分支）。</summary>
-        private static bool IsUnsafeFallback(SemanticModel model, InvocationExpressionSyntax invocation, System.Threading.CancellationToken ct)
+        /// <summary>
+        /// 顺着表达式往外走，跟踪“调用失败（返回 false）时，当前表达式的值”，直到遇到 if / return / lambda 体等去处。
+        /// </summary>
+        private static DecidesUse ClassifyDecidesUse(SemanticModel model, ExpressionSyntax call, System.Threading.CancellationToken ct)
         {
-            SyntaxNode cond = invocation;
-            while (cond.Parent is ParenthesizedExpressionSyntax)
-                cond = cond.Parent;
-            bool negated = false;
-            if (cond.Parent is PrefixUnaryExpressionSyntax not && not.IsKind(SyntaxKind.LogicalNotExpression))
+            SyntaxNode node = call;
+            bool valueOnFailure = false;
+            while (true)
             {
-                negated = true;
-                cond = not;
-                while (cond.Parent is ParenthesizedExpressionSyntax)
-                    cond = cond.Parent;
-            }
-
-            switch (cond.Parent)
-            {
-                case IfStatementSyntax ifs when ifs.Condition == cond:
+                SyntaxNode? parent = node.Parent;
+                switch (parent)
                 {
-                    StatementSyntax? falseBranch = negated ? ifs.Statement : ifs.Else?.Statement;
-                    return falseBranch == null || !Propagates(model, falseBranch, ct);
+                    case ParenthesizedExpressionSyntax:
+                        node = parent;
+                        continue;
+                    case PrefixUnaryExpressionSyntax neg when neg.IsKind(SyntaxKind.LogicalNotExpression):
+                        valueOnFailure = !valueOnFailure;
+                        node = parent;
+                        continue;
+                    case BinaryExpressionSyntax bin when bin.IsKind(SyntaxKind.LogicalAndExpression) || bin.IsKind(SyntaxKind.LogicalOrExpression):
+                    {
+                        bool shortCircuitValue = bin.IsKind(SyntaxKind.LogicalOrExpression);
+                        if (valueOnFailure != shortCircuitValue && bin.Left == node)
+                        {
+                            // 失败后右边还会执行：除非右边本身就是失败值，否则就是“失败后做了别的事”
+                            if (!IsFailureValue(model, bin.Right, ct))
+                                return DecidesUse.Fallback;
+                            valueOnFailure = false;
+                        }
+                        node = parent;
+                        continue;
+                    }
+                    case ConditionalExpressionSyntax ce when ce.Condition == node:
+                    {
+                        if (!IsFailureValue(model, valueOnFailure ? ce.WhenTrue : ce.WhenFalse, ct))
+                            return DecidesUse.Fallback;
+                        valueOnFailure = false;
+                        node = parent;
+                        continue;
+                    }
+                    case ConditionalExpressionSyntax:
+                        node = parent;
+                        continue;
+                    case IfStatementSyntax ifs when ifs.Condition == node:
+                    {
+                        StatementSyntax? branch = valueOnFailure ? ifs.Statement : ifs.Else?.Statement;
+                        return branch != null && Propagates(model, branch, ct) ? DecidesUse.Propagated : DecidesUse.Fallback;
+                    }
+                    case ReturnStatementSyntax:
+                        return valueOnFailure ? DecidesUse.Fallback : DecidesUse.Propagated;
+                    case ArrowExpressionClauseSyntax:
+                        if (model.GetEnclosingSymbol(node.SpanStart, ct) is IMethodSymbol { ReturnsVoid: true })
+                            return DecidesUse.Discarded;
+                        return valueOnFailure ? DecidesUse.Fallback : DecidesUse.Propagated;
+                    case LambdaExpressionSyntax lambda when lambda.Body == node:
+                        if (model.GetSymbolInfo(lambda, ct).Symbol is IMethodSymbol { ReturnsVoid: true })
+                            return DecidesUse.Discarded;
+                        return valueOnFailure ? DecidesUse.Fallback : DecidesUse.Propagated;
+                    case ExpressionStatementSyntax:
+                        return DecidesUse.Discarded;
+                    case AssignmentExpressionSyntax asg when asg.Right == node && asg.Left is IdentifierNameSyntax { Identifier.ValueText: "_" }:
+                        return DecidesUse.Discarded;
+                    default:
+                        return DecidesUse.Indirect;
                 }
-                case BinaryExpressionSyntax bin when bin.IsKind(SyntaxKind.LogicalOrExpression) && bin.Left == cond && !negated:
-                    return true;
-                case ConditionalExpressionSyntax ce when ce.Condition == cond:
-                {
-                    var falseExpr = negated ? ce.WhenTrue : ce.WhenFalse;
-                    return !IsFailureValue(model, falseExpr, ct);
-                }
-                default:
-                    return false;
             }
         }
 
@@ -1526,8 +1582,6 @@ namespace Godot.SourceGenerators
                     return true;
                 case ReturnStatementSyntax ret:
                     return ret.Expression != null && IsFailureValue(model, ret.Expression, ct);
-                case ExpressionStatementSyntax es when es.Expression is InvocationExpressionSyntax inv:
-                    return model.GetSymbolInfo(inv, ct).Symbol is IMethodSymbol m && IsVtxType(m.ContainingType, "Tx") && m.Name == "Fail";
                 default:
                     return false;
             }
@@ -1594,7 +1648,7 @@ namespace Godot.SourceGenerators
 
             if (IsVtxType(containing, "TxTask"))
             {
-                if (sym is IMethodSymbol && sym.Name is not ("Forget" or "Defer"))
+                if (sym is IMethodSymbol && sym.Name is not ("Forget" or "Defer" or "SwitchToMainThread"))
                     message = $"后台线程里调用了 '{member}'：TxTask 的等待登记表只能在主线程使用。先 await 回到主线程（不要 ConfigureAwait(false)），再等待";
             }
             else if (IsVtxType(containing, "TxGodot"))
@@ -1724,6 +1778,21 @@ namespace Godot.SourceGenerators
                 return ThreadDispatch.None;
             }
             return ThreadDispatch.None;
+        }
+
+        private static void AnalyzeDecidesSignature(SymbolAnalysisContext context)
+        {
+            var method = (IMethodSymbol)context.Symbol;
+            if (method.IsImplicitlyDeclared || method.MethodKind is MethodKind.LambdaMethod or MethodKind.PropertySet or MethodKind.EventAdd or MethodKind.EventRemove)
+                return;
+            if ((GetEffects(method) & Effect.Decides) == 0 || method.ReturnType.SpecialType == SpecialType.System_Boolean)
+                return;
+            // 继承来的效果也算：override 一个 [Decides] 方法同样必须返回 bool
+            foreach (var location in method.Locations)
+            {
+                if (location.IsInSource)
+                    context.ReportDiagnostic(Diagnostic.Create(RuleDecidesSignature, location, method.Name));
+            }
         }
 
         private static void AnalyzeAsyncVoid(SyntaxNodeAnalysisContext context)

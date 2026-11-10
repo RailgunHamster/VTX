@@ -171,8 +171,8 @@ namespace Godot.SourceGenerators
 
                 var location = methodDecl.Identifier.GetLocation();
                 string? problem = CheckContainingType(method.ContainingType, "[TxInvariant]");
-                if (problem == null && (method.IsStatic || method.Parameters.Length > 0 || !method.ReturnsVoid || method.IsGenericMethod))
-                    problem = $"[TxInvariant] 方法 '{method.Name}' 必须是无参数、非泛型、返回 void 的实例方法。";
+                if (problem == null && (method.IsStatic || method.Parameters.Length > 0 || method.ReturnType.SpecialType != SpecialType.System_Boolean || method.IsGenericMethod))
+                    problem = $"[TxInvariant] 方法 '{method.Name}' 必须是无参数、非泛型、返回 bool 的实例方法（返回 false 表示不变量被破坏，例如 => Tx.Require(Gold >= 0, \"金币不能为负\")）。";
                 if (problem != null)
                 {
                     Report(context, location, problem);
@@ -296,22 +296,23 @@ namespace Godot.SourceGenerators
             sb.AppendLine("    [global::System.ComponentModel.EditorBrowsable(global::System.ComponentModel.EditorBrowsableState.Never)]");
             sb.AppendLine("    [global::VTX.Decides]");
             if (ancestorGenerated)
-                sb.Append("    protected override void ").Append(InvariantMethodName).AppendLine("()");
+                sb.Append("    protected override bool ").Append(InvariantMethodName).AppendLine("()");
             else if (type.IsSealed)
-                sb.Append("    private void ").Append(InvariantMethodName).AppendLine("()");
+                sb.Append("    private bool ").Append(InvariantMethodName).AppendLine("()");
             else
-                sb.Append("    protected virtual void ").Append(InvariantMethodName).AppendLine("()");
+                sb.Append("    protected virtual bool ").Append(InvariantMethodName).AppendLine("()");
             sb.AppendLine("    {");
             if (ancestorGenerated)
-                sb.Append("        base.").Append(InvariantMethodName).AppendLine("();");
+                sb.Append("        if (!base.").Append(InvariantMethodName).AppendLine("()) return false;");
             foreach (var inv in spec.Invariants)
-                sb.Append("        this.").Append(inv).AppendLine("();");
+                sb.Append("        if (!this.").Append(inv).AppendLine("()) return false;");
+            sb.AppendLine("        return true;");
             sb.AppendLine("    }");
             sb.AppendLine();
             if (!ancestorGenerated)
             {
                 sb.AppendLine("    [global::VTX.Decides]");
-                sb.Append("    void global::VTX.ITxObject.ValidateTxInvariants() => this.").Append(InvariantMethodName).AppendLine("();");
+                sb.Append("    bool global::VTX.ITxObject.ValidateTxInvariants() => this.").Append(InvariantMethodName).AppendLine("();");
                 sb.AppendLine();
             }
 

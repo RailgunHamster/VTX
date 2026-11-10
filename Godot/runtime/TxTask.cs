@@ -595,6 +595,35 @@ public static class TxTask
     }
 
     /// <summary>
+    /// 回到主线程：在后台线程上（Task.Run 里、ConfigureAwait(false) 之后）<c>await TxTask.SwitchToMainThread();</c>，
+    /// 后面的代码就在主线程继续（下一次处理续体时，通常是同一帧或下一帧）。已经在主线程时立即继续。
+    /// 注意：主线程上 SetResult 一个 TaskCompletionSource 并不能把后台的 await 带回主线程（续体会被排到线程池），要用这个。
+    /// </summary>
+    public static MainThreadAwaitable SwitchToMainThread() => default;
+
+    /// <summary><see cref="SwitchToMainThread"/> 的可等待对象。</summary>
+    public readonly struct MainThreadAwaitable
+    {
+        public MainThreadAwaiter GetAwaiter() => default;
+    }
+
+    /// <summary><see cref="SwitchToMainThread"/> 的等待器：把续体投递到 Godot 主线程的同步上下文。</summary>
+    public readonly struct MainThreadAwaiter : System.Runtime.CompilerServices.INotifyCompletion
+    {
+        public bool IsCompleted => VtxThread.IsMainThread;
+
+        public void GetResult() { }
+
+        public void OnCompleted(Action continuation)
+        {
+            ArgumentNullException.ThrowIfNull(continuation);
+            SynchronizationContext context = Dispatcher.SynchronizationContext
+                ?? throw new InvalidOperationException("VTX: 找不到 Godot 主线程的同步上下文。");
+            context.Post(static state => ((Action)state!)(), continuation);
+        }
+    }
+
+    /// <summary>
     /// “发出去不管”的任务：不等待它，但它抛出的异常（取消除外）会通过 GD.PushError 报告，而不是悄悄丢失。
     /// 用法：<c>PlayHitEffect(ct).Forget();</c>
     /// </summary>

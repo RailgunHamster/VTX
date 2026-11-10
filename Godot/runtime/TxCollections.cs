@@ -37,8 +37,7 @@ public sealed class TxArray<T> : IReadOnlyList<T>
         {
             if ((uint)index >= (uint)_items.Length)
             {
-                Tx.FailOrThrow($"TxArray 下标越界: {index} (Length={_items.Length})",
-                    new ArgumentOutOfRangeException(nameof(index), index, "Index was out of range."));
+                throw new ArgumentOutOfRangeException(nameof(index), index, "Index was out of range.");
             }
             T prev = _items[index];
             if (!EqualityComparer<T>.Default.Equals(prev, value))
@@ -52,12 +51,17 @@ public sealed class TxArray<T> : IReadOnlyList<T>
         }
     }
 
-    /// <summary>可失败下标读取（越界时失败回滚；事务外越界抛 <see cref="TxFailedException"/>）。</summary>
+    /// <summary>可失败下标读取：越界时记录失败原因并返回 false。<c>if (!Cells.TryGetAt(i, out var c)) return false;</c></summary>
     [Decides]
-    public T At(int index)
+    public bool TryGetAt(int index, [MaybeNullWhen(false)] out T value)
     {
-        Tx.Check((uint)index < (uint)_items.Length, "TxArray 下标越界");
-        return _items[index];
+        if ((uint)index < (uint)_items.Length)
+        {
+            value = _items[index];
+            return true;
+        }
+        value = default;
+        return Tx.Failed("TxArray 下标越界");
     }
 
     public IEnumerator<T> GetEnumerator() => ((IEnumerable<T>)_items).GetEnumerator();
@@ -86,8 +90,7 @@ public sealed class TxList<T> : IReadOnlyList<T>
         {
             if ((uint)index >= (uint)_items.Count)
             {
-                Tx.FailOrThrow($"TxList 下标越界: {index} (Count={_items.Count})",
-                    new ArgumentOutOfRangeException(nameof(index), index, "Index was out of range."));
+                throw new ArgumentOutOfRangeException(nameof(index), index, "Index was out of range.");
             }
             T prev = _items[index];
             if (!EqualityComparer<T>.Default.Equals(prev, value))
@@ -101,14 +104,17 @@ public sealed class TxList<T> : IReadOnlyList<T>
         }
     }
 
-    /// <summary>
-    /// 可失败下标读取（越界时自动触发事务回滚，无需手写 if 边界检查）。
-    /// </summary>
+    /// <summary>可失败下标读取：越界时记录失败原因并返回 false。<c>if (!Items.TryGetAt(i, out var it)) return false;</c></summary>
     [Decides]
-    public T At(int index)
+    public bool TryGetAt(int index, [MaybeNullWhen(false)] out T value)
     {
-        Tx.Check((uint)index < (uint)_items.Count, "TxList 下标越界");
-        return _items[index];
+        if ((uint)index < (uint)_items.Count)
+        {
+            value = _items[index];
+            return true;
+        }
+        value = default;
+        return Tx.Failed("TxList 下标越界");
     }
 
     [Transacts]
@@ -127,8 +133,7 @@ public sealed class TxList<T> : IReadOnlyList<T>
     {
         if ((uint)index > (uint)_items.Count)
         {
-            Tx.FailOrThrow($"TxList.Insert 下标越界: {index} (Count={_items.Count})",
-                new ArgumentOutOfRangeException(nameof(index), index, "Index must be within the bounds of the List."));
+            throw new ArgumentOutOfRangeException(nameof(index), index, "Index must be within the bounds of the List.");
         }
         _items.Insert(index, item);
         if (Tx.IsActive)
@@ -142,8 +147,7 @@ public sealed class TxList<T> : IReadOnlyList<T>
     {
         if ((uint)index >= (uint)_items.Count)
         {
-            Tx.FailOrThrow($"TxList.RemoveAt 下标越界: {index} (Count={_items.Count})",
-                new ArgumentOutOfRangeException(nameof(index), index, "Index was out of range."));
+            throw new ArgumentOutOfRangeException(nameof(index), index, "Index was out of range.");
         }
         T prev = _items[index];
         _items.RemoveAt(index);
@@ -210,13 +214,13 @@ public sealed class TxDict<TKey, TValue> : IEnumerable<KeyValuePair<TKey, TValue
 
     public TValue this[TKey key]
     {
-        [Decides]
+        // 不存在的键抛 KeyNotFoundException（这是 bug，不是失败）；可能不存在时用 TryGetValue。
+        [Pure]
         get
         {
             if (!_dict.TryGetValue(key, out TValue? val))
             {
-                Tx.FailOrThrow($"TxDict 中不存在键 '{key}'",
-                    new KeyNotFoundException($"The given key '{key}' was not present in the dictionary."));
+                throw new KeyNotFoundException($"The given key '{key}' was not present in the dictionary.");
             }
             return val;
         }

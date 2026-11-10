@@ -11,13 +11,13 @@ public partial class Hero
 
     [Pure] public int Peek() { Raw++; return Raw; }                 // expect: VTX010
     [Pure] public int Twice(int x) { int y = x; y *= 2; return y; }  // expect: none
-    [Pure] public bool CanHit() => Tx.Simulate(() => Hit(3));       // expect: none
-    [Pure] public void BadPure() { Hit(1); }                        // expect: VTX010
+    [Pure] public bool CanHit() => Tx.Simulate(this, static s => s.Hit(3)); // expect: none
+    [Pure] public bool BadPure() => Hit(1);                         // expect: VTX010
     [Pure] public void BadPure2() { Tx.Try(() => Hit(1)); }         // expect: VTX010
     [Pure] public void BadPure3() { Hp = 3; }                       // expect: VTX010
     [Pure] public int Ok(List<int> xs) => xs.Count + Math.Abs(-1) + Twice(2); // expect: none
 
-    [Decides] public void Hit(int dmg) { Hp -= dmg; Tx.Check(Hp >= 0); } // expect: none
+    [Decides] public bool Hit(int dmg) { Hp -= dmg; return Tx.Require(Hp >= 0); } // expect: none
 
     public void MutateSelf() { Raw = 1; }
     [Transacts] public void MutateSelfTx() { Hp = 1; }

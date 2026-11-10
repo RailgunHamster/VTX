@@ -10,6 +10,7 @@ namespace GodotTest.Examples;
 /// <summary>
 /// VTX 全特性完整示例：
 /// 涵盖基础事务、回溯搜索、结构化并发、自动快照/Diff、类不变量、失败原因追踪、
+/// 失败的写法：[Decides] 方法一律返回 bool，用 Tx.Require / Tx.Failed，调用方 if (!X()) return false; 传播；
 /// 以及新增的：
 /// - 特性 8：[TxPersistable] + [TxBaselineField] 存档向后兼容编译校验 + ToTxJson / FromTxJson
 /// - 特性 9：VTX.Res 强类型资产清单（Assets as Code）+ VTX008 路径存在性编译校验
@@ -45,23 +46,22 @@ public partial class VtxFeatureShowcase : Node3D
     // 特性 4：类不变量校验（[TxInvariant]）
     // =========================================================================
     [TxInvariant]
-    private void CheckClassInvariants()
-    {
-        Tx.Check(Gold >= 0, "金币不能为负数");
-        Tx.Check(Mana >= 0 && Mana <= MaxMana, "法力值超出合法区间 [0, MaxMana]");
-    }
+    private bool CheckClassInvariants() =>
+        Tx.Require(Gold >= 0, "金币不能为负数") &&
+        Tx.Require(Mana >= 0 && Mana <= MaxMana, "法力值超出合法区间 [0, MaxMana]");
 
     // =========================================================================
     // 核心模式：CanExecute 与 Execute 二合一（[Decides]）
     // =========================================================================
     [Decides]
-    public void BuyAndDrinkPotion(string potionName, int price, int manaRestore)
+    public bool BuyAndDrinkPotion(string potionName, int price, int manaRestore)
     {
+        if (!Tx.Require(Gold >= price, "金币不足")) return false;
         Gold -= price;
-        Tx.Check(Gold >= 0, "金币不足");
 
-        Mana += manaRestore;
+        Mana += manaRestore;   // 超过 MaxMana 时由 [TxInvariant] 在提交前拦下
         Buffs[potionName] = Buffs.GetOrDefault(potionName, 0) + 1;
+        return true;
     }
 
     // =========================================================================
@@ -70,8 +70,12 @@ public partial class VtxFeatureShowcase : Node3D
     public readonly record struct ShopOffer(string Name, int Price, int ManaRestore);
 
     [Pure]
-    public List<ShopOffer> GetAffordableAndValidOffers(IEnumerable<ShopOffer> offers) =>
-        Tx.WhereCan(offers, offer => BuyAndDrinkPotion(offer.Name, offer.Price, offer.ManaRestore));
+    public List<ShopOffer> GetAffordableAndValidOffers(IEnumerable<ShopOffer> offers)
+    {
+        var valid = new List<ShopOffer>();
+        Tx.WhereCan(offers, offer => BuyAndDrinkPotion(offer.Name, offer.Price, offer.ManaRestore), valid);
+        return valid;
+    }
 
     public bool TryBuyFirstAvailableOffer(IEnumerable<ShopOffer> priorityOffers, out ShopOffer chosen) =>
         Tx.FirstOf(
@@ -158,15 +162,16 @@ public partial class VtxFeatureShowcase : Node3D
     // 特性 12：确定性可回滚随机数（TxRandom）
     // =========================================================================
     [Decides]
-    public int RollForgeEnhancement(int goldCost)
+    public bool TryRollForgeEnhancement(int goldCost, out int bonus)
     {
+        bonus = 0;
+        if (!Tx.Require(Gold >= goldCost, "强化金币不足")) return false;
         Gold -= goldCost;
-        Tx.Check(Gold >= 0, "强化金币不足");
 
         // 使用 TxRandom 生成随机暴击倍率：
         // 若在 Simulate 中预览，种子会在预览结束后自动回退；紧接着调 Try 会掷出完全相同的点数！
-        int bonus = Rng.NextInt(10, 100);
-        return bonus;
+        bonus = Rng.NextInt(10, 100);
+        return true;
     }
 
     public bool VerifyDeterministicRollBetweenSimulateAndTry()
@@ -174,12 +179,12 @@ public partial class VtxFeatureShowcase : Node3D
         ulong initialSeed = Rng.State;
 
         // 1. 先用 Simulate 沙盒预览下一次强化会掷出多少点加成
-        bool canRoll = Tx.Simulate(() => RollForgeEnhancement(20), out int previewBonus);
+        bool canRoll = Tx.Simulate(this, static (VtxFeatureShowcase s, out int bonus) => s.TryRollForgeEnhancement(20, out bonus), out int previewBonus);
         // Simulate 结束后，Rng.State 已自动回滚回 initialSeed，Gold 仍为 100
         bool seedRewound = Rng.State == initialSeed && Gold == 100;
 
         // 2. 再用 Try 真正执行强化：因为种子已回退到同一位置，掷出的加成与预览 100% 相同！
-        bool committed = Tx.Try(() => RollForgeEnhancement(20), out int actualBonus);
+        bool committed = Tx.Try(this, static (VtxFeatureShowcase s, out int bonus) => s.TryRollForgeEnhancement(20, out bonus), out int actualBonus);
         Gold = 100; // 还原金币供后续测试
 
         return canRoll && seedRewound && committed && previewBonus == actualBonus;

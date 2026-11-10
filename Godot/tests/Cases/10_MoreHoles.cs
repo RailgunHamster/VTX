@@ -71,7 +71,7 @@ public static class CaseRun
         Tx.Try(() => v.Public = 3);
         if (v.Public != 3) return "Public";
         var o = new Outer2<string>.Inner2();
-        Tx.Try(() => { o.Value = "a"; Tx.Fail(); });
+        Tx.Try(o, static o => { o.Value = "a"; return false; });
         if (o.Value != null) return "Outer2<T>.Inner2 回滚";
         var d = new DerivedFromNonPartial();
         if (!Tx.Try(() => d.Y = 2) || d.Y != 2) return "DerivedFromNonPartial";

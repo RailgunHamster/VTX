@@ -29,17 +29,29 @@ public partial class Shop : Node
         BuyWithGold(price);                                                          // expect: VTX014
         _ = BuyWithGold(price);                                                      // expect: VTX014
         if (!BuyWithGold(price)) return false;                                       // expect: none
-        if (!BuyWithGold(price)) { Tx.Fail("x"); }                                   // expect: none
+        if (!BuyWithGold(price)) { return Tx.Failed("x"); }                          // expect: none
         if (!BuyWithGold(price)) return Tx.Failed("买不起");                          // expect: none
         if (BuyWithGold(price)) { } else { throw new InvalidOperationException(); }  // expect: none
         if (!BuyWithGold(price)) BuyWithGems(1);                                     // expect: VTX015, VTX014
         if (BuyWithGold(price)) { Gems += 1; }                                       // expect: VTX015
-        bool any = BuyWithGold(price) || BuyWithGems(price);                         // expect: VTX015
-        bool both = BuyWithGold(price) && BuyWithGems(price);                        // expect: none
+        bool any = BuyWithGold(price) || BuyWithGems(price);                         // expect: VTX015, VTX014
+        bool both = BuyWithGold(price) && BuyWithGems(price);                        // expect: VTX014（不能先存进变量）
+        var ok = BuyWithGold(price);                                                 // expect: VTX014
+        Use(BuyWithGold(price));                                                     // expect: VTX014
+        if (BuyWithGold(price) || Tx.Failed("都不行")) { }                            // expect: VTX015（|| 右边是失败值：整体等价于 BuyWithGold，但 if 没有 else）
+        if (!(BuyWithGold(1) && BuyWithGems(1))) return false;                       // expect: none
+        if (!BuyWithGold(1) && !BuyWithGems(1)) return false;                        // expect: VTX015（A 失败后还会执行 B）
+        if (Tx.Require(Gold > 0) ? BuyWithGold(1) : false) { } else return false;    // expect: none
+        if (BuyWithGold(1) ? true : BuyWithGems(1)) { } else return false;           // expect: VTX015
         if (!Tx.Try(this, static s => s.BuyWithGold(5))) { Gems -= 1; }              // expect: none（保存点：失败那一支已回滚）
         if (!Tx.Require(Gems > 0)) { Gold += 1; }                                    // expect: none（Require 自己不改状态）
         return BuyWithGold(price) && BuyWithGems(price);                             // expect: none
     }
+
+    [Decides] public bool Inverted() => !BuyWithGold(1);                             // expect: VTX015（失败时返回了 true）
+    [Decides] public void OldStyle() { }                                             // expect: VTX016
+    [Decides] public int OldValue() => 1;                                            // expect: VTX016
+    [Pure] private static bool Use(bool b) => b;
 
     public void OnClick()
     {
@@ -47,6 +59,8 @@ public partial class Shop : Node
         if (Tx.Try(() => BuyWithGold(3))) { }                                        // expect: none
         if (BuyWithGold(3)) { }                                                      // expect: VTX015
         Tx.FirstOf(new[] { 1, 2 }, p => BuyWithGold(p), out int chosen);             // expect: none
+        Tx.Try(() => { BuyWithGold(1); });                                           // expect: VTX014
+        Tx.Try(() => BuyWithGold(1) && BuyWithGems(1));                              // expect: none
     }
 }
 

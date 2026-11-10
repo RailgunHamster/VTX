@@ -16,7 +16,7 @@ public partial class Unit : Node3D
     [Transacts]
     public async Task Bad() { await Task.Yield(); }                            // expect: VTX003, VTX002
 
-    [Decides]
+    [Transacts]
     public void Rules(IAsyncEnumerable<int> xs, TxRandom rng)
     {
         var n = new Node();                                                    // expect: VTX002

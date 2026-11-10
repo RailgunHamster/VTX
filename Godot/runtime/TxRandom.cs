@@ -91,12 +91,13 @@ public sealed class TxRandom
     }
 
     /// <summary>
-    /// 事务内概率检定（Decides）：若未命中概率，直接中断并回滚当前事务。
+    /// 事务内概率检定（Decides）：未命中时记录原因并返回 false。<c>if (!Rng.CheckChance(0.3f, "没暴击")) return false;</c>
     /// </summary>
     [Decides]
-    public void CheckChance(float probability, string? reason = null)
+    public bool CheckChance(float probability, string? reason = null)
     {
-        bool hit = Chance(probability);
-        Tx.Check(hit, reason ?? $"概率检定未通过 (p={probability:P0})");
+        if (Chance(probability))
+            return true;
+        return Tx.Failed(reason ?? $"概率检定未通过 (p={probability:P0})");
     }
 }

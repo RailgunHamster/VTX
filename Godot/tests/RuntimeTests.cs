@@ -23,10 +23,10 @@ internal sealed class Wallet : ITxObject
             _gold = value;
         }
     }
-    public void ValidateTxInvariants()
+    public bool ValidateTxInvariants()
     {
         InvariantCalls++;
-        Tx.Check(Gold >= 0, "金币不能为负数");
+        return Tx.Require(Gold >= 0, "金币不能为负数");
     }
 }
 
@@ -41,7 +41,7 @@ internal static class RuntimeTests
             var dict = new TxDict<string, int>();
             T.True(Tx.Try(() => { list.Add(1); arr[0] = 5; dict["a"] = 1; }), "提交成功");
             T.Eq(1, list.Count, "list"); T.Eq(5, arr[0], "arr"); T.Eq(1, dict["a"], "dict");
-            T.True(!Tx.Try(() => { list.Add(2); arr[0] = 6; dict["a"] = 2; dict["b"] = 3; Tx.Fail("x"); }), "失败");
+            T.True(!Tx.Try(() => { list.Add(2); arr[0] = 6; dict["a"] = 2; dict["b"] = 3; return Tx.Failed("x"); }), "失败");
             T.Eq(1, list.Count, "list 回滚"); T.Eq(5, arr[0], "arr 回滚"); T.Eq(1, dict["a"], "dict 回滚"); T.True(!dict.ContainsKey("b"), "新键回滚");
             T.Eq(0, Tx.Depth, "深度"); T.Eq(0, Tx.UndoLogCount, "日志清空");
         });
@@ -53,7 +53,7 @@ internal static class RuntimeTests
             T.True(Tx.Try(() =>
             {
                 list.Add(1);
-                innerOk = Tx.Try(() => { list.Add(2); Tx.Fail(); });
+                innerOk = Tx.Try(() => { list.Add(2); return false; });
                 list.Add(3);
             }), "外层提交");
             T.True(!innerOk, "内层失败");
@@ -67,7 +67,7 @@ internal static class RuntimeTests
             T.True(!Tx.Try(() =>
             {
                 Tx.Try(() => { list.Add(1); Tx.Defer(() => deferred.Add("inner")); });
-                Tx.Fail();
+                return false;
             }), "外层失败");
             T.Eq(0, list.Count, "内层修改也回滚");
             T.Eq(0, deferred.Count, "内层的 Defer 不执行");
@@ -79,8 +79,6 @@ internal static class RuntimeTests
             var ran = new List<string>();
             T.True(Tx.Simulate(() => { list.Add(1); Tx.Defer(() => ran.Add("sim")); }), "Simulate 成功");
             T.Eq(0, list.Count, "Simulate 回滚"); T.Eq(0, ran.Count, "Simulate 不执行 Defer");
-            T.True(Tx.Simulate(() => { list.Add(7); return list.Count; }, out int count), "带返回值");
-            T.Eq(1, count, "返回值");
             T.True(Tx.Try(() =>
             {
                 list.Add(1);
@@ -120,7 +118,7 @@ internal static class RuntimeTests
             T.Eq(0, Tx.Depth, "深度恢复为 0");
             T.True(!Tx.IsActive, "不在事务中");
             var gold = new TxList<int>(); gold.Add(100);
-            T.True(!Tx.Try(() => { gold[0] = 0; Tx.Check(false); }), "之后的事务失败");
+            T.True(!Tx.Try(() => { gold[0] = 0; return false; }), "之后的事务失败");
             T.Eq(100, gold[0], "之后的事务能正确回滚");
 
             var agg = T.Throws<AggregateException>(() => Tx.Try(() =>
@@ -138,7 +136,7 @@ internal static class RuntimeTests
             Tx.Try(() => Tx.Defer(() =>
             {
                 T.True(!Tx.IsActive, "延迟动作在事务外执行");
-                T.True(!Tx.Try(() => { list.Add(9); Tx.Fail(); }), "新事务可失败");
+                T.True(!Tx.Try(() => { list.Add(9); return false; }), "新事务可失败");
                 T.True(Tx.Try(() => list.Add(1)), "新事务可提交");
             }));
             T.Eq("1", string.Join(",", list), "结果");
@@ -155,17 +153,7 @@ internal static class RuntimeTests
             T.Eq(0, list.Count, "Simulate 已回滚");
         });
 
-        T.Add("Tx: 事务外失败抛公开异常（回归 #6）", () =>
-        {
-            var ex = T.Throws<TxFailedException>(() => Tx.Check(1 > 2, "比较"), "Check");
-            if (ex != null) T.True(ex.Reason!.Contains("1 > 2"), "Reason 含表达式");
-            T.Throws<TxFailedException>(() => Tx.Fail("x"), "Fail");
-            T.Throws<TxFailedException>(() => Tx.NotNull<string>(null), "NotNull");
-            T.Throws<TxFailedException>(() => Tx.NotNull<int>(null), "NotNull struct");
-            T.Eq(0, Tx.Depth, "深度");
-        });
-
-        T.Add("Tx 容器: 越界在事务外抛标准异常、在事务内失败回滚", () =>
+        T.Add("Tx 容器: 越界是 bug：事务内外都抛标准异常，事务内先回滚", () =>
         {
             var list = new TxList<int>(); list.Add(1);
             var arr = new TxArray<int>(1);
@@ -175,18 +163,22 @@ internal static class RuntimeTests
             T.Throws<ArgumentOutOfRangeException>(() => list.RemoveAt(5), "TxList RemoveAt");
             T.Throws<ArgumentOutOfRangeException>(() => arr[3] = 1, "TxArray set");
             T.Throws<KeyNotFoundException>(() => _ = dict["none"], "TxDict get");
-            T.Throws<TxFailedException>(() => list.At(5), "At 是 [Decides]");
-            T.True(!Tx.Try(() => { list.Add(2); list[9] = 1; }), "事务内越界失败");
+            T.Throws<ArgumentOutOfRangeException>(() => Tx.Try(() => { list.Add(2); list[9] = 1; }), "事务内越界抛异常");
             T.Eq(1, list.Count, "并回滚");
-            T.True(!Tx.Try(() => { _ = dict["none"]; }), "事务内缺键失败");
-            T.True(!Tx.Try(() => list.RemoveAt(-1)), "RemoveAt 失败");
+            T.Throws<KeyNotFoundException>(() => Tx.Try(() => { list.Add(3); _ = dict["none"]; }), "事务内缺键抛异常");
+            T.Eq(1, list.Count, "并回滚");
+            T.True(!Tx.Try(list, static l => l.TryGetAt(5, out _)), "TryGetAt 越界返回 false");
+            T.Eq("TxList 下标越界", Tx.LastFailReason, "TryGetAt 原因");
+            T.True(Tx.Try(list, static l => l.TryGetAt(0, out int v) && v == 1), "TryGetAt 成功");
+            T.True(!Tx.Try(arr, static a => a.TryGetAt(-1, out _)), "TxArray.TryGetAt 越界");
+            T.Eq(0, Tx.Depth, "深度");
         });
 
         T.Add("Tx 容器: Clear/Remove/Insert 回滚后内容与顺序一致", () =>
         {
             var list = new TxList<string>();
             foreach (var s in new[] { "a", "b", "c", "d" }) list.Add(s);
-            T.True(!Tx.Try(() => { list.Remove("b"); list.Insert(0, "x"); list.RemoveAt(3); list.Clear(); list.Add("z"); Tx.Fail(); }), "失败");
+            T.True(!Tx.Try(() => { list.Remove("b"); list.Insert(0, "x"); list.RemoveAt(3); list.Clear(); list.Add("z"); return false; }), "失败");
             T.Eq("a,b,c,d", string.Join(",", list), "列表");
             var dict = new TxDict<string, int>();
             dict.Set("A", 1); dict.Set("B", 2); dict.Set("C", 3);
@@ -198,14 +190,14 @@ internal static class RuntimeTests
         T.Add("Tx: 失败原因（LastFailReason / out failReason）", () =>
         {
             int gold = 10;
-            T.True(!Tx.Try(() => Tx.Check(gold > 20, "金币不足"), out string? reason), "失败");
+            T.True(!Tx.Try(gold, static gold => Tx.Require(gold > 20, "金币不足"), out string? reason), "失败");
             T.Eq("金币不足 (gold > 20)", reason, "带原因与表达式");
             T.True(!Tx.Try(() => false), "Func<bool> 返回 false");
             T.Eq("Transaction body returned false", Tx.LastFailReason, "默认原因");
             // 嵌套：先有一个被吞掉的内层失败，之后外层 body 返回 false，不应沿用旧原因
             T.True(!Tx.Try(() =>
             {
-                Tx.Try(() => Tx.Fail("内层"));
+                Tx.Try(() => Tx.Failed("内层"));
                 return Tx.Try(() => false);
             }), "外层失败");
             T.Eq("Transaction body returned false", Tx.LastFailReason, "不沿用过期原因");
@@ -229,7 +221,7 @@ internal static class RuntimeTests
             T.Eq(1, objs[0].InvariantCalls, "每个对象只校验一次");
             T.Eq(0, Tx.UndoLogCount, "提交后清空");
             // 回滚后 touched 集合也要清理：再次修改仍会被校验
-            T.True(!Tx.Try(() => { w.Gold = 5; Tx.Fail(); }), "失败");
+            T.True(!Tx.Try(() => { w.Gold = 5; return false; }), "失败");
             T.True(!Tx.Try(() => { w.Gold = -9; }), "再次触碰仍校验");
         });
 
@@ -241,7 +233,7 @@ internal static class RuntimeTests
                 list.Add(1);
                 Tx.Record(list, 0, static (_, _) => throw new InvalidOperationException("bad undo"));
                 list.Add(2);
-                Tx.Fail();
+                return false;
             }), "报告回滚异常");
             T.Eq(0, list.Count, "其余步骤仍恢复");
             T.Eq(0, Tx.Depth, "深度");
@@ -252,12 +244,14 @@ internal static class RuntimeTests
         {
             var w = new Wallet { Gold = 50 };
             var offers = new[] { 80, 60, 30, 10 };
-            var can = Tx.WhereCan(offers, p => w.Gold -= p);
+            // 不写 Require：靠 Wallet 的不变量（Gold >= 0）在提交前拦下
+            var can = new List<int>();
+            Tx.WhereCan(offers, p => { w.Gold -= p; return true; }, can);
             T.Eq("30,10", string.Join(",", can), "WhereCan");
             T.Eq(50, w.Gold, "WhereCan 不改状态");
-            T.True(Tx.FirstOf(offers, p => w.Gold -= p, out int chosen), "FirstOf");
+            T.True(Tx.FirstOf(offers, p => { w.Gold -= p; return true; }, out int chosen), "FirstOf");
             T.Eq(30, chosen, "选中第一个合法项"); T.Eq(20, w.Gold, "并提交");
-            T.True(!Tx.FirstOf(new[] { 100 }, p => w.Gold -= p, out _), "都失败");
+            T.True(!Tx.FirstOf(new[] { 100 }, p => { w.Gold -= p; return true; }, out _), "都失败");
             T.Eq(20, w.Gold, "都失败时不变");
         });
 
@@ -265,12 +259,16 @@ internal static class RuntimeTests
         {
             var rng = new TxRandom(42);
             ulong s0 = rng.State;
-            Tx.Simulate(() => rng.NextInt(100), out int preview);
+            var preview = new int[1];
+            Tx.Simulate(() => { preview[0] = rng.NextInt(100); });
             T.Eq(s0, rng.State, "Simulate 后种子回退");
-            Tx.Try(() => rng.NextInt(100), out int actual);
-            T.Eq(preview, actual, "结果一致");
+            int actual = 0;
+            Tx.Try(() => { actual = rng.NextInt(100); });
+            T.Eq(preview[0], actual, "结果一致");
+            T.True(!Tx.Try(rng, static r => r.CheckChance(0f, "不可能")), "CheckChance 未命中返回 false");
+            T.Eq("不可能", Tx.LastFailReason, "CheckChance 原因");
             ulong s1 = rng.State;
-            Tx.Try(() => { rng.NextUInt(); rng.NextUInt(); Tx.Fail(); });
+            Tx.Try(() => { rng.NextUInt(); rng.NextUInt(); return false; });
             T.Eq(s1, rng.State, "失败回滚");
             T.True(rng.NextInt(-5, 5) is >= -5 and < 5, "范围");
             T.Eq(int.MinValue <= rng.NextInt(int.MinValue, int.MaxValue), true, "大范围不溢出");
@@ -315,17 +313,16 @@ internal static class RuntimeTests
             T.True(!Tx.Require(false), "事务外 Require(false) 只返回 false 不抛异常");
         });
 
-        T.Add("Tx: 失败原因延迟格式化后与以前一致", () =>
+        T.Add("Tx: 失败原因的格式", () =>
         {
             string? s = null;
-            int? n = null;
-            T.True(!Tx.Try(() => Tx.Check(1 > 2, "r")), "Check"); T.Eq("r (1 > 2)", Tx.LastFailReason, "Check 带原因");
-            T.True(!Tx.Try(() => Tx.Check(1 > 2)), "Check"); T.Eq("1 > 2", Tx.LastFailReason, "Check 无原因");
-            T.True(!Tx.Try(() => { Tx.NotNull(s); }), "NotNull"); T.Eq("s is not null", Tx.LastFailReason, "NotNull 引用");
-            T.True(!Tx.Try(() => { Tx.NotNull(n, "要数字"); }), "NotNull?"); T.Eq("要数字 (n.HasValue)", Tx.LastFailReason, "NotNull 值");
-            T.True(!Tx.Try(() => Tx.Fail()), "Fail"); T.Eq("Tx.Fail()", Tx.LastFailReason, "Fail 默认");
-            var ex = T.Throws<TxFailedException>(() => Tx.Check(false, "外面"), "事务外");
-            T.Eq("外面 (false)", ex.Reason, "事务外原因");
+            T.True(!Tx.Try(() => Tx.Require(1 > 2, "r")), "Require"); T.Eq("r (1 > 2)", Tx.LastFailReason, "带原因");
+            T.True(!Tx.Try(() => Tx.Require(1 > 2)), "Require"); T.Eq("1 > 2", Tx.LastFailReason, "无原因时用表达式");
+            T.True(!Tx.Try(() => s is not { } v ? Tx.Failed("没有名字") : v.Length > 0), "判空"); T.Eq("没有名字", Tx.LastFailReason, "判空原因");
+            T.True(!Tx.Try(() => Tx.Failed()), "Failed"); T.Eq("Tx.Failed()", Tx.LastFailReason, "Failed 默认");
+            var w = new Wallet { Gold = 1 };
+            T.True(!Tx.Try(() => { w.Gold = -1; }), "不变量");
+            T.Eq("金币不能为负数 (Gold >= 0)", Tx.LastFailReason, "不变量原因");
             T.True(Tx.Try(() => { }), "成功"); T.Eq(null, Tx.LastFailReason, "顶层成功后清空");
         });
 
@@ -367,7 +364,7 @@ internal static class RuntimeTests
                 using (var scope = Tx.EnterWorkerScope())
                 {
                     var w = new Wallet { Gold = 5 };
-                    scopedOk = !Tx.Try(() => { w.Gold = 1; Tx.Fail(); });
+                    scopedOk = !Tx.Try(() => { w.Gold = 1; return false; });
                     scopedGold = w.Gold;
                     var n = new Node3D();
                     try { Tx.Try(() => TxGodot.SetPosition(n, new Vector3(1, 0, 0))); } catch (Exception e) { godotObj = e; }
@@ -400,7 +397,7 @@ internal static class RuntimeTests
                 TxGodot.EmitSignal(emitter, "hit", 1);
                 TxGodot.QueueFree(child);
                 TxGodot.Log("never");
-                Tx.Fail();
+                return false;
             }), "失败");
             T.True(n3.Position == default, "位置回滚"); T.True(n3.Visible, "3D 可见性回滚"); T.True(n2.Visible, "2D 可见性回滚");
             T.Eq(0f, n2.Rotation, "2D 旋转回滚"); T.True(n2.Scale == new Vector2(1, 1), "2D 缩放回滚");
@@ -427,7 +424,7 @@ internal static class RuntimeTests
             {
                 TxGodot.SetPosition(n, new Vector3(1, 0, 0));
                 n.Free();
-                Tx.Fail();
+                return false;
             }), "失败且不抛异常");
             T.Eq(0, Tx.Depth, "深度");
         });

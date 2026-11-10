@@ -3,9 +3,9 @@
 面向 AI 辅助游戏开发的**单线程内存事务回滚（Transactional Rollback）**、**帧同步结构化并发（Structured Concurrency）**与 **编译期效果红线（Compile-Time Effect Redlines）**基础设施。
 
 核心思路：
-- **消除 `CanExecute()` 与 `Execute()` 的逻辑分裂**：只写一份带 `[Decides]` 的业务规则代码，直接修改状态并用 `Tx.Check(cond)` 校验。UI 可用性判定或 AI 走法推演直接调用 `Tx.Simulate(...)`（试跑后 100% 自动回滚），真正执行调用 `Tx.Try(...)`（全部成功则提交，任一步失败则逆序自动回滚）。
+- **消除 `CanExecute()` 与 `Execute()` 的逻辑分裂**：只写一份带 `[Decides]` 的业务规则代码（返回 `bool`，条件不满足就 `return Tx.Failed(...)`），直接修改状态。UI 可用性判定或 AI 走法推演直接调用 `Tx.Simulate(...)`（试跑后 100% 自动回滚），真正执行调用 `Tx.Try(...)`（全部成功则提交，任一步返回 false 则逆序自动回滚）。
 - **结构化并发零泄漏**：提供按游戏帧时间推进的 `TxTask.Race` / `Sync` / `Sleep` / `NextFrame` / `WaitUntil` / `WaitSignal`，赢家完成时自动取消落败分支并退订信号回调；`TxTask.LifetimeOf(node)` 让协程随节点释放自动停止。
-- **80% 状态回滚 + 编译期红线**：通过源码生成器自动生成 `[TxField]` 属性 Undo Log，并由编译器静态分析器强制执行 `VTX001`~`VTX012` 红线。事务内修改非事务状态、调用不可逆 API、跨帧 `await`、给 `[Pure]` 偷偷加副作用等越界行为会在编译期当场拦截（检查范围与已知盲区见 [`Godot/docs/AI_GUIDE.md`](Godot/docs/AI_GUIDE.md)）。
+- **80% 状态回滚 + 编译期红线**：通过源码生成器自动生成 `[TxField]` 属性 Undo Log，并由编译器静态分析器强制执行 `VTX001`~`VTX016` 红线。事务内修改非事务状态、调用不可逆 API、跨帧 `await`、给 `[Pure]` 偷偷加副作用等越界行为会在编译期当场拦截（检查范围与已知盲区见 [`Godot/docs/AI_GUIDE.md`](Godot/docs/AI_GUIDE.md)）。
 
 ## 引擎支持
 
